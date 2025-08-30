@@ -208,7 +208,49 @@ if upl is None:
     st.code("pip install streamlit pandas openpyxl xlrd xlsxwriter", language="bash")
     st.stop()
 
-base, table, receipts, advances = load_data(upl.read())
+file_bytes = upl.read()
+base, table, receipts, advances = load_data(file_bytes)
+
+# ====== 진단 & 수동 매핑 (업로드했는데 변동 없을 때) ======
+if base.empty:
+    st.warning("업로드된 파일에서 인식된 데이터가 없습니다. 시트/헤더를 수동으로 지정해 보세요.")
+    try:
+        excel_dbg = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        with st.expander("🧪 진단 보기(시트/미리보기)", expanded=False):
+            st.write({"sheets": excel_dbg.sheet_names})
+            for nm in excel_dbg.sheet_names[:5]:
+                try:
+                    preview = pd.read_excel(excel_dbg, sheet_name=nm, nrows=8, header=None)
+                    st.write(f"**{nm}**", preview)
+                except Exception as e:
+                    st.write(f"{nm}: 읽기 실패 - {e}")
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_r = st.selectbox("선수금 시트 선택", ["(없음)"] + excel_dbg.sheet_names, index=0)
+            hdr_r = st.number_input("선수금 헤더 행 번호(0부터)", min_value=0, value=0, step=1)
+        with c2:
+            sel_a = st.selectbox("선급금 시트 선택", ["(없음)"] + excel_dbg.sheet_names, index=0)
+            hdr_a = st.number_input("선급금 헤더 행 번호(0부터)", min_value=0, value=0, step=1)
+        if st.button("수동 매핑으로 다시 불러오기"):
+            df_r_raw = pd.read_excel(excel_dbg, sheet_name=sel_r, dtype=str, header=hdr_r) if sel_r != "(없음)" else pd.DataFrame()
+            df_a_raw = pd.read_excel(excel_dbg, sheet_name=sel_a, dtype=str, header=hdr_a) if sel_a != "(없음)" else pd.DataFrame()
+            receipts = standardize(df_r_raw, "선수금")
+            advances = standardize(df_a_raw, "선급금")
+            base = pd.concat([receipts, advances], ignore_index=True)
+            if base.empty:
+                st.error("여전히 인식된 데이터가 없습니다. 헤더 행 번호를 바꿔보세요 (보통 0~3). 또는 시트 선택을 다시 해보세요.")
+            else:
+                # 재계산
+                agg_r = base[base["direction"]=="선수금"].groupby("contract_id")["amount"].sum().rename("선수금_합계")
+                agg_a = base[base["direction"]=="선급금"].groupby("contract_id")["amount"].sum().rename("선급금_합계")
+                agg = pd.concat([agg_r, agg_a], axis=1).fillna(0.0)
+                agg["Gap(선수-선급)"] = agg["선수금_합계"] - agg["선급금_합계"]
+                meta_cols = ["owner","party","status"]
+                meta = base.groupby("contract_id")[meta_cols].agg(lambda s: s.dropna().astype(str).replace({"","nan","None"}, pd.NA).dropna().unique()[:1])
+                for c in meta_cols:
+                    meta[c] = meta[c].apply(lambda arr: arr[0] if isinstance(arr,(list,tuple,pd.Series)) and len(arr)>0 else "")
+                table = agg.join(meta, how="left").reset_index().rename(columns={"contract_id":"계약ID","owner":"담당자","party":"주요거래처","status":"진행현황"})
+                st.success("수동 매핑으로 데이터 로드 완료! 아래 집계가 갱신되었습니다.")
 
 # ===================== KPIs =====================
 col1, col2, col3, col4 = st.columns(4)
