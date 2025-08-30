@@ -136,100 +136,99 @@ async function readExcelFile(file) {
     });
 }
 
-// 서버로 데이터 전송
+// 실제 Excel 데이터 분석
 async function sendDataToServer(excelData) {
-    // 실제로는 Excel 데이터를 분석하여 선수금/선급금을 매칭하는 로직이 필요
-    // 지금은 mock 데이터를 반환
-    
-    // 진행률 업데이트
-    updateProgress(30);
-    
-    await sleep(500);
-    updateProgress(60);
-    
-    await sleep(500);
-    updateProgress(90);
-    
-    // Mock 분석 로직 - 실제로는 여기서 복잡한 매칭 알고리즘 실행
-    const mockResult = await analyzeMockData(excelData);
-    
-    updateProgress(100);
-    await sleep(200);
-    
-    return mockResult;
+    try {
+        // 진행률 업데이트
+        updateProgress(20);
+        
+        // 실제 Excel 분석 엔진 사용
+        console.log('Excel 분석 시작...');
+        const analysisResult = await window.excelAnalyzer.analyzeExcelData(excelData);
+        
+        updateProgress(70);
+        await sleep(300);
+        
+        updateProgress(90);
+        await sleep(200);
+        
+        console.log('Excel 분석 완료:', analysisResult);
+        
+        updateProgress(100);
+        await sleep(200);
+        
+        return analysisResult;
+        
+    } catch (error) {
+        console.error('Excel 분석 오류:', error);
+        throw new Error('Excel 파일 분석 중 오류가 발생했습니다: ' + error.message);
+    }
 }
 
-// Mock 데이터 분석 (실제 구현에서는 복잡한 매칭 로직)
-async function analyzeMockData(excelData) {
-    // 시트 개수와 데이터 크기에 따라 동적으로 생성
-    const sheetCount = Object.keys(excelData).length;
-    const totalRows = Object.values(excelData).reduce((sum, sheet) => sum + sheet.length, 0);
-    
-    const contracts = [];
-    const contractIds = ['PJT-001', 'PJT-002', 'PJT-003', 'PJT-004', 'PJT-005'];
-    const companies = ['삼성전자', 'LG전자', 'SK하이닉스', '현대자동차', 'POSCO'];
-    const owners = ['김철수', '박영희', '이민수', '정하나', '최민준'];
-    const statuses = ['진행중', '완료', '검토중', '보류'];
-    
-    for (let i = 0; i < Math.min(sheetCount + 2, 8); i++) {
-        const receipts = Math.floor(Math.random() * 50000000) + 5000000; // 5M~55M
-        const advances = Math.floor(receipts * (0.6 + Math.random() * 0.3)); // 60-90% of receipts
-        
-        contracts.push({
-            contract_id: contractIds[i % contractIds.length] + (i > 4 ? `-${Math.floor(i/5) + 1}` : ''),
-            receipts: receipts,
-            advances: advances,
-            gap: receipts - advances,
-            party: companies[i % companies.length],
-            owner: owners[i % owners.length],
-            status: statuses[i % statuses.length]
-        });
+// 분석 결과 검증 및 후처리
+function validateAnalysisResult(result) {
+    // 기본 구조 검증
+    if (!result || !result.summary || !result.contracts) {
+        throw new Error('분석 결과 형식이 올바르지 않습니다.');
     }
     
-    // 총계 계산
-    const totalReceipts = contracts.reduce((sum, c) => sum + c.receipts, 0);
-    const totalAdvances = contracts.reduce((sum, c) => sum + c.advances, 0);
-    const totalGap = totalReceipts - totalAdvances;
-    const overdueCount = Math.floor(contracts.length * 0.2); // 20% 연체
+    // 데이터 유효성 검증
+    if (result.contracts.length === 0) {
+        throw new Error('분석할 수 있는 계약 데이터가 없습니다. Excel 파일의 데이터 형식을 확인해주세요.');
+    }
     
-    return {
-        summary: {
-            total_receipts: totalReceipts,
-            total_advances: totalAdvances,
-            gap: totalGap,
-            contract_count: contracts.length,
-            overdue_count: overdueCount
-        },
-        contracts: contracts
-    };
+    // 필수 필드 검증
+    result.contracts.forEach((contract, index) => {
+        if (!contract.contract_id || contract.contract_id.trim() === '') {
+            console.warn(`계약 ${index + 1}: 계약ID가 없습니다.`);
+        }
+        if (typeof contract.receipts !== 'number' || typeof contract.advances !== 'number') {
+            console.warn(`계약 ${contract.contract_id}: 금액 데이터가 올바르지 않습니다.`);
+        }
+    });
+    
+    return result;
 }
 
 // 대시보드 업데이트
 function updateDashboard(data) {
-    currentData = data;
-    
-    // KPI 업데이트
-    document.getElementById('totalReceipts').textContent = formatCurrency(data.summary.total_receipts);
-    document.getElementById('totalAdvances').textContent = formatCurrency(data.summary.total_advances);
-    
-    const gapElement = document.getElementById('totalGap');
-    gapElement.textContent = formatCurrency(data.summary.gap);
-    gapElement.className = `text-lg font-semibold ${data.summary.gap >= 0 ? 'text-green-600' : 'text-red-600'}`;
-    
-    document.getElementById('contractCount').textContent = data.summary.contract_count + '개';
-    document.getElementById('overdueCount').textContent = data.summary.overdue_count + '건';
-    
-    // 테이블 업데이트
-    updateContractsTable(data.contracts);
-    
-    // 차트 업데이트
-    updateChart(data.contracts);
-    
-    // 상위 계약 업데이트
-    updateTopContracts(data.contracts);
-    
-    // 대시보드 표시
-    document.getElementById('dashboard').classList.remove('hidden');
+    try {
+        // 데이터 검증
+        const validatedData = validateAnalysisResult(data);
+        currentData = validatedData;
+        
+        // 분석 정보 표시
+        if (validatedData.validation_info) {
+            showAnalysisInfo(validatedData.validation_info);
+        }
+        
+        // KPI 업데이트
+        document.getElementById('totalReceipts').textContent = formatCurrency(validatedData.summary.total_receipts);
+        document.getElementById('totalAdvances').textContent = formatCurrency(validatedData.summary.total_advances);
+        
+        const gapElement = document.getElementById('totalGap');
+        gapElement.textContent = formatCurrency(validatedData.summary.gap);
+        gapElement.className = `text-lg font-semibold ${validatedData.summary.gap >= 0 ? 'text-green-600' : 'text-red-600'}`;
+        
+        document.getElementById('contractCount').textContent = validatedData.summary.contract_count + '개';
+        document.getElementById('overdueCount').textContent = validatedData.summary.overdue_count + '건';
+        
+        // 테이블 업데이트
+        updateContractsTable(validatedData.contracts);
+        
+        // 차트 업데이트
+        updateChart(validatedData.contracts);
+        
+        // 상위 계약 업데이트
+        updateTopContracts(validatedData.contracts);
+        
+        // 대시보드 표시
+        document.getElementById('dashboard').classList.remove('hidden');
+        
+    } catch (error) {
+        console.error('대시보드 업데이트 오류:', error);
+        showError('대시보드 업데이트 중 오류가 발생했습니다: ' + error.message);
+    }
 }
 
 // 계약 테이블 업데이트
@@ -424,6 +423,37 @@ function showNotification(message, type) {
     }, 5000);
 }
 
+// 분석 정보 표시
+function showAnalysisInfo(validationInfo) {
+    const notification = document.createElement('div');
+    notification.className = 'fixed top-4 left-4 bg-blue-50 border border-blue-200 text-blue-800 p-4 rounded-lg shadow-lg z-50 max-w-sm';
+    notification.innerHTML = `
+        <div class="flex items-start">
+            <i class="fas fa-info-circle text-blue-600 mr-2 mt-1"></i>
+            <div>
+                <h4 class="font-semibold mb-2">분석 완료</h4>
+                <ul class="text-sm space-y-1">
+                    <li>📄 감지된 시트: ${validationInfo.시트_목록?.join(', ') || 'N/A'}</li>
+                    <li>📊 선수금: ${validationInfo.선수금_표준화_행수 || 0}건 (원본: ${validationInfo.선수금_원본_행수 || 0}건)</li>
+                    <li>📊 선급금: ${validationInfo.선급금_표준화_행수 || 0}건 (원본: ${validationInfo.선급금_원본_행수 || 0}건)</li>
+                    <li>✅ 총 처리: ${validationInfo.총_데이터_건수 || 0}건</li>
+                </ul>
+                <button onclick="this.parentElement.parentElement.parentElement.remove()" 
+                        class="mt-2 text-xs text-blue-600 hover:text-blue-800">닫기</button>
+            </div>
+        </div>
+    `;
+    
+    document.body.appendChild(notification);
+    
+    // 10초 후 자동 제거
+    setTimeout(() => {
+        if (notification.parentElement) {
+            notification.remove();
+        }
+    }, 10000);
+}
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -431,6 +461,13 @@ function sleep(ms) {
 // 초기화
 document.addEventListener('DOMContentLoaded', function() {
     console.log('📊 선수/선급금 대시보드가 로드되었습니다.');
+    
+    // Excel 분석 엔진 로드 확인
+    if (window.excelAnalyzer) {
+        console.log('✅ Excel 분석 엔진이 로드되었습니다.');
+    } else {
+        console.error('❌ Excel 분석 엔진을 로드할 수 없습니다.');
+    }
     
     // API 연결 테스트
     fetch('/api/hello')
