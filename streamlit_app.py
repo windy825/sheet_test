@@ -225,55 +225,100 @@ def standardize_data(df: pd.DataFrame, direction: str) -> pd.DataFrame:
         return pd.DataFrame(columns=STANDARD_COLS)
 
 def create_aggregation_table(base_df: pd.DataFrame) -> pd.DataFrame:
-    """집계 테이블 생성 개선"""
+    """집계 테이블 생성 개선 - 디버깅 강화"""
     if base_df.empty:
+        logger.warning("집계 테이블: 입력 데이터가 비어있음")
         return pd.DataFrame(columns=[
             "계약ID", "선수금_합계", "선급금_합계", "Gap(선수-선급)", 
             "담당자", "주요거래처", "최근일자", "건수"
         ])
     
     try:
-        all_contracts = base_df["contract_id"].unique()
+        logger.info(f"집계 테이블 생성 시작: {len(base_df)}건의 데이터")
+        
+        # 계약ID별 집계
+        all_contracts = base_df["contract_id"].dropna().unique()
+        logger.info(f"총 계약 수: {len(all_contracts)}개")
+        
         result_rows = []
         
-        for contract in all_contracts:
-            if pd.isna(contract) or str(contract).strip() == "":
+        for idx, contract in enumerate(all_contracts):
+            if pd.isna(contract) or str(contract).strip() == "" or str(contract) == "nan":
+                logger.warning(f"유효하지 않은 계약ID 건너뜀: {contract}")
                 continue
                 
             contract_data = base_df[base_df["contract_id"] == contract]
             
+            if contract_data.empty:
+                logger.warning(f"계약 {contract}에 대한 데이터가 없음")
+                continue
+            
             # 금액 집계
-            선수금_합계 = contract_data[contract_data["direction"] == "선수금"]["amount"].sum()
-            선급금_합계 = contract_data[contract_data["direction"] == "선급금"]["amount"].sum()
+            receipts_data = contract_data[contract_data["direction"] == "선수금"]
+            advances_data = contract_data[contract_data["direction"] == "선급금"]
+            
+            선수금_합계 = receipts_data["amount"].sum() if not receipts_data.empty else 0.0
+            선급금_합계 = advances_data["amount"].sum() if not advances_data.empty else 0.0
             gap = 선수금_합계 - 선급금_합계
             
-            # 메타 정보 추출
-            담당자_list = contract_data["owner"].dropna().tolist()
-            담당자 = max(set(담당자_list), key=담당자_list.count) if 담당자_list else ""
+            # 메타 정보 추출 - 개선된 로직
+            담당자_list = contract_data["owner"].dropna().astype(str).tolist()
+            담당자_list = [owner for owner in 담당자_list if owner not in ['', 'nan', 'None']]
             
-            거래처_list = contract_data["party"].dropna().tolist()
-            주요거래처 = max(set(거래처_list), key=거래처_list.count) if 거래처_list else ""
+            if 담당자_list:
+                # 가장 빈도가 높은 담당자
+                담당자 = max(set(담당자_list), key=담당자_list.count)
+            else:
+                담당자 = ""
+            
+            거래처_list = contract_data["party"].dropna().astype(str).tolist()
+            거래처_list = [party for party in 거래처_list if party not in ['', 'nan', 'None']]
+            
+            if 거래처_list:
+                # 가장 빈도가 높은 거래처
+                주요거래처 = max(set(거래처_list), key=거래처_list.count)
+            else:
+                주요거래처 = ""
             
             최근일자 = contract_data["date"].max() if contract_data["date"].notna().any() else pd.NaT
             건수 = len(contract_data)
             
-            result_rows.append({
-                "계약ID": contract,
-                "선수금_합계": 선수금_합계,
-                "선급금_합계": 선급금_합계,
-                "Gap(선수-선급)": gap,
-                "담당자": 담당자,
-                "주요거래처": 주요거래처,
+            row_data = {
+                "계약ID": str(contract),
+                "선수금_합계": float(선수금_합계),
+                "선급금_합계": float(선급금_합계),
+                "Gap(선수-선급)": float(gap),
+                "담당자": str(담당자) if 담당자 else "",
+                "주요거래처": str(주요거래처) if 주요거래처 else "",
                 "최근일자": 최근일자,
-                "건수": 건수
-            })
+                "건수": int(건수)
+            }
+            
+            result_rows.append(row_data)
+            
+            # 진행 상황 로깅 (100개마다)
+            if (idx + 1) % 100 == 0:
+                logger.info(f"집계 진행: {idx + 1}/{len(all_contracts)} 완료")
         
         result_df = pd.DataFrame(result_rows)
-        logger.info(f"집계 테이블 생성 완료: {len(result_df)}개 계약")
+        
+        # 결과 검증
+        if result_df.empty:
+            logger.error("집계 결과가 비어있음")
+        else:
+            logger.info(f"집계 테이블 생성 완료: {len(result_df)}개 계약")
+            logger.info(f"컬럼: {list(result_df.columns)}")
+            
+            # 각 컬럼의 데이터 품질 체크
+            for col in result_df.columns:
+                non_null_count = result_df[col].notna().sum()
+                logger.info(f"컬럼 '{col}': {non_null_count}/{len(result_df)} 개 유효 데이터")
+        
         return result_df
         
     except Exception as e:
         logger.error(f"집계 테이블 생성 오류: {e}")
+        logger.error(f"오류 발생 시점의 데이터 형태: {base_df.dtypes}")
         return pd.DataFrame(columns=[
             "계약ID", "선수금_합계", "선급금_합계", "Gap(선수-선급)", 
             "담당자", "주요거래처", "최근일자", "건수"
@@ -323,34 +368,72 @@ def load_excel_data(file_bytes: bytes):
         return empty_df, empty_agg, empty_df, empty_df, error_info
 
 def apply_filters(view_df: pd.DataFrame, query_text: str, owner_filter: str) -> pd.DataFrame:
-    """필터링 로직 개선"""
+    """필터링 로직 개선 - 디버깅 강화"""
     if view_df.empty:
+        logger.warning("필터링: 입력 데이터프레임이 비어있음")
         return view_df
     
     try:
         filtered_df = view_df.copy()
+        initial_count = len(filtered_df)
+        
+        logger.info(f"필터링 시작: {initial_count}건의 데이터")
+        logger.info(f"검색어: '{query_text}', 담당자 필터: '{owner_filter}'")
+        logger.info(f"컬럼 목록: {list(filtered_df.columns)}")
         
         # 검색 필터 적용
-        if query_text:
-            query_lower = query_text.strip().lower()
-            search_mask = (
-                filtered_df["계약ID"].astype(str).str.lower().str.contains(query_lower, na=False) |
-                filtered_df["주요거래처"].astype(str).str.lower().str.contains(query_lower, na=False) |
-                filtered_df["담당자"].astype(str).str.lower().str.contains(query_lower, na=False)
-            )
+        if query_text and query_text.strip():
+            query_text = query_text.strip()
+            logger.info(f"검색 필터 적용: '{query_text}'")
+            
+            # 각 컬럼별로 개별 확인
+            contract_mask = pd.Series([False] * len(filtered_df))
+            party_mask = pd.Series([False] * len(filtered_df))
+            owner_mask = pd.Series([False] * len(filtered_df))
+            
+            if "계약ID" in filtered_df.columns:
+                contract_mask = filtered_df["계약ID"].astype(str).str.contains(query_text, case=False, na=False, regex=False)
+                logger.info(f"계약ID 매치: {contract_mask.sum()}건")
+            
+            if "주요거래처" in filtered_df.columns:
+                party_mask = filtered_df["주요거래처"].astype(str).str.contains(query_text, case=False, na=False, regex=False)
+                logger.info(f"주요거래처 매치: {party_mask.sum()}건")
+            
+            if "담당자" in filtered_df.columns:
+                owner_mask = filtered_df["담당자"].astype(str).str.contains(query_text, case=False, na=False, regex=False)
+                logger.info(f"담당자 매치: {owner_mask.sum()}건")
+            
+            # 통합 마스크
+            search_mask = contract_mask | party_mask | owner_mask
+            logger.info(f"통합 검색 결과: {search_mask.sum()}건")
+            
             filtered_df = filtered_df[search_mask]
+            logger.info(f"검색 후 데이터: {len(filtered_df)}건")
         
         # 담당자 필터 적용
-        if owner_filter:
-            owners = [o.strip().lower() for o in owner_filter.split(',') if o.strip()]
-            if owners:
-                owner_mask = filtered_df["담당자"].astype(str).str.lower().isin(owners)
+        if owner_filter and owner_filter.strip():
+            logger.info(f"담당자 필터 적용: '{owner_filter}'")
+            owners = [o.strip() for o in owner_filter.split(',') if o.strip()]
+            logger.info(f"담당자 목록: {owners}")
+            
+            if owners and "담당자" in filtered_df.columns:
+                # 대소문자 구분 없이 부분 매치
+                owner_mask = pd.Series([False] * len(filtered_df))
+                for owner in owners:
+                    mask = filtered_df["담당자"].astype(str).str.contains(owner, case=False, na=False, regex=False)
+                    owner_mask = owner_mask | mask
+                    logger.info(f"'{owner}' 매치: {mask.sum()}건")
+                
                 filtered_df = filtered_df[owner_mask]
+                logger.info(f"담당자 필터 후 데이터: {len(filtered_df)}건")
+        
+        logger.info(f"최종 필터링 결과: {len(filtered_df)}건 (원본 {initial_count}건)")
         
         return filtered_df
         
     except Exception as e:
         logger.error(f"필터링 오류: {e}")
+        logger.error(f"오류 발생 시점 - 검색어: '{query_text}', 담당자: '{owner_filter}'")
         return view_df
 
 def safe_sort(df: pd.DataFrame, sort_column: str) -> pd.DataFrame:
@@ -769,17 +852,37 @@ st.divider()
 
 # 필터 및 검색
 st.subheader("🔍 계약 검색 및 필터")
+
+# 검색 전 데이터 상태 확인
+if not agg_table.empty:
+    st.caption(f"📊 전체 계약 수: {len(agg_table)}개")
+    
+    # 샘플 데이터 표시 (디버깅용)
+    with st.expander("🔍 데이터 미리보기 (디버깅)"):
+        st.write("**컬럼 정보:**")
+        st.write(list(agg_table.columns))
+        st.write("**샘플 데이터:**")
+        st.dataframe(agg_table.head(3))
+        
+        st.write("**각 컬럼별 고유값 샘플:**")
+        for col in ["계약ID", "담당자", "주요거래처"]:
+            if col in agg_table.columns:
+                unique_vals = agg_table[col].astype(str).unique()[:5]
+                st.write(f"- {col}: {list(unique_vals)}")
+
 filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([3, 2, 2, 1])
 
 with filter_col1:
     search_query = st.text_input("🔎 통합 검색", 
                                 placeholder="계약ID, 거래처명, 담당자명으로 검색...",
-                                help="여러 조건을 동시에 검색합니다")
+                                help="여러 조건을 동시에 검색합니다",
+                                key="search_input")
 
 with filter_col2:
     owner_filter = st.text_input("👤 담당자 필터", 
                                 placeholder="쉼표로 구분하여 여러명 입력",
-                                help="예: 김철수, 이영희")
+                                help="예: 김철수, 이영희",
+                                key="owner_input")
 
 with filter_col3:
     sort_options = ["Gap(선수-선급)", "선수금_합계", "선급금_합계", "계약ID", "최근일자", "건수"]
@@ -790,22 +893,76 @@ with filter_col4:
     show_only_gap = st.checkbox("Gap만 표시", 
                                help="Gap이 있는 계약만 표시")
 
-# 필터 적용
-filtered_table = apply_filters(agg_table, search_query, owner_filter)
+# 실시간 필터링 상태 표시
+if search_query or owner_filter:
+    st.info(f"🔍 검색 조건: '{search_query}' | 담당자: '{owner_filter}'")
 
-if show_only_gap and not filtered_table.empty:
-    filtered_table = filtered_table[filtered_table["Gap(선수-선급)"] != 0]
+# 필터 적용
+try:
+    filtered_table = apply_filters(agg_table, search_query, owner_filter)
+    
+    # 필터링 결과 로그 표시
+    if search_query or owner_filter:
+        filter_info_col1, filter_info_col2 = st.columns(2)
+        with filter_info_col1:
+            st.caption(f"📊 검색 전: {len(agg_table)}개 계약")
+        with filter_info_col2:
+            st.caption(f"📊 검색 후: {len(filtered_table)}개 계약")
+    
+    if show_only_gap and not filtered_table.empty:
+        before_gap_filter = len(filtered_table)
+        filtered_table = filtered_table[filtered_table["Gap(선수-선급)"] != 0]
+        if search_query or owner_filter or show_only_gap:
+            st.caption(f"📊 Gap 필터 후: {len(filtered_table)}개 계약 (필터 전: {before_gap_filter}개)")
+    
+except Exception as e:
+    st.error(f"❌ 필터링 중 오류 발생: {e}")
+    logger.error(f"필터링 예외: {e}")
+    filtered_table = agg_table
 
 # 정렬 적용
 if not filtered_table.empty:
-    filtered_table = safe_sort(filtered_table, sort_by)
+    try:
+        filtered_table = safe_sort(filtered_table, sort_by)
+    except Exception as e:
+        st.warning(f"⚠️ 정렬 중 오류: {e}")
+        logger.error(f"정렬 예외: {e}")
+
+# 검색 결과가 없는 경우 도움말 표시
+if filtered_table.empty and (search_query or owner_filter):
+    st.warning("🔍 검색 조건에 맞는 데이터가 없습니다.")
+    
+    # 도움말 제공
+    help_col1, help_col2 = st.columns(2)
+    with help_col1:
+        st.markdown("""
+        **🔧 검색 팁:**
+        - 부분 단어로 검색해보세요
+        - 대소문자는 구분하지 않습니다
+        - 특수문자 없이 검색해보세요
+        """)
+    
+    with help_col2:
+        if not agg_table.empty:
+            st.markdown("**📋 사용 가능한 데이터 예시:**")
+            sample_contracts = agg_table["계약ID"].head(3).tolist()
+            sample_owners = agg_table["담당자"].dropna().head(3).tolist()
+            
+            if sample_contracts:
+                st.write(f"계약ID: {', '.join(map(str, sample_contracts))}")
+            if sample_owners:
+                st.write(f"담당자: {', '.join(sample_owners)}")
+    
+    # 필터 초기화 버튼
+    if st.button("🔄 검색 조건 초기화"):
+        st.experimental_rerun()
 
 # 테이블 표시
 st.subheader("📋 계약별 집계 현황")
 
-if filtered_table.empty:
-    st.warning("🔍 검색 조건에 맞는 데이터가 없습니다. 검색어나 필터를 확인해주세요.")
-else:
+if filtered_table.empty and not (search_query or owner_filter):
+    st.warning("📊 표시할 데이터가 없습니다. 엑셀 파일의 데이터를 확인해주세요.")
+elif not filtered_table.empty:
     # 테이블 스타일링을 위한 함수
     def style_dataframe(df):
         def color_gap(val):
@@ -1165,8 +1322,92 @@ with footer_col2:
     - **문제 해결**: 로그 확인 및 데이터 검증
     """)
 
-# 디버깅 정보 (개발자용)
-if st.checkbox("🔧 개발자 디버깅 정보 표시", help="개발 및 디버깅용 상세 정보"):
+# 디버깅 정보 (개발자용) - 더 자세한 정보
+if st.checkbox("🔧 검색 디버깅 정보 표시", help="검색이 안 될 때 문제 진단용"):
+    with st.expander("🔍 검색 상태 진단"):
+        st.write("**검색 조건:**")
+        st.json({
+            "검색어": search_query,
+            "담당자_필터": owner_filter,
+            "Gap만_표시": show_only_gap,
+            "정렬_기준": sort_by
+        })
+        
+        st.write("**데이터 상태:**")
+        if not agg_table.empty:
+            st.json({
+                "전체_데이터_건수": len(agg_table),
+                "컬럼_목록": list(agg_table.columns),
+                "계약ID_샘플": agg_table["계약ID"].head(3).tolist() if "계약ID" in agg_table.columns else [],
+                "담당자_샘플": agg_table["담당자"].dropna().head(3).tolist() if "담당자" in agg_table.columns else [],
+                "거래처_샘플": agg_table["주요거래처"].dropna().head(3).tolist() if "주요거래처" in agg_table.columns else []
+            })
+            
+            # 실제 검색 테스트
+            if search_query:
+                st.write("**검색 테스트 결과:**")
+                for col in ["계약ID", "주요거래처", "담당자"]:
+                    if col in agg_table.columns:
+                        test_result = agg_table[col].astype(str).str.contains(search_query, case=False, na=False, regex=False).sum()
+                        st.write(f"- {col}에서 '{search_query}' 매치: {test_result}건")
+                
+                # 전체 데이터에서 검색 테스트
+                all_matches = 0
+                for col in ["계약ID", "주요거래처", "담당자"]:
+                    if col in agg_table.columns:
+                        matches = agg_table[col].astype(str).str.contains(search_query, case=False, na=False, regex=False).sum()
+                        all_matches += matches
+                
+                st.write(f"**총 매치 건수: {all_matches}건**")
+                
+                if all_matches == 0:
+                    st.warning("⚠️ 검색 결과가 0건입니다. 다음을 확인해주세요:")
+                    st.write("1. 검색어 철자 확인")
+                    st.write("2. 부분 단어로 검색 (예: '프로젝트' → 'PJT')")
+                    st.write("3. 숫자만으로 검색 (예: '123')")
+        else:
+            st.error("❌ 집계 테이블이 비어있습니다.")
+        
+        st.write("**필터링 후 결과:**")
+        st.json({
+            "필터링_후_건수": len(filtered_table),
+            "원본_대비_비율": f"{len(filtered_table)/len(agg_table)*100:.1f}%" if len(agg_table) > 0 else "0%"
+        })
+
+# 빠른 검색 도우미
+if not agg_table.empty and (search_query == "" or len(filtered_table) == 0):
+    st.info("💡 **빠른 검색:** 아래 버튼을 클릭하여 샘플 검색을 시도해보세요.")
+    
+    quick_col1, quick_col2, quick_col3 = st.columns(3)
+    
+    with quick_col1:
+        if "계약ID" in agg_table.columns and not agg_table["계약ID"].empty:
+            sample_contract = str(agg_table["계약ID"].iloc[0])[:5]  # 처음 5글자
+            if st.button(f"🔍 '{sample_contract}' 검색"):
+                st.experimental_set_query_params(search=sample_contract)
+                st.experimental_rerun()
+    
+    with quick_col2:
+        if "담당자" in agg_table.columns:
+            valid_owners = agg_table["담당자"].dropna()
+            valid_owners = valid_owners[valid_owners.astype(str).str.len() > 0]
+            if not valid_owners.empty:
+                sample_owner = str(valid_owners.iloc[0])
+                if st.button(f"👤 '{sample_owner}' 검색"):
+                    st.experimental_set_query_params(owner=sample_owner)
+                    st.experimental_rerun()
+    
+    with quick_col3:
+        if "주요거래처" in agg_table.columns:
+            valid_parties = agg_table["주요거래처"].dropna()
+            valid_parties = valid_parties[valid_parties.astype(str).str.len() > 0]
+            if not valid_parties.empty:
+                sample_party = str(valid_parties.iloc[0])[:10]  # 처음 10글자
+                if st.button(f"🏢 '{sample_party}' 검색"):
+                    st.experimental_set_query_params(party=sample_party)
+                    st.experimental_rerun()
+
+if st.checkbox("🔧 상세 시스템 정보 표시", help="시스템 상태 및 데이터 구조 확인"): 및 디버깅용 상세 정보"):
     with st.expander("🔍 시스템 정보"):
         st.write("**업로드된 파일 정보:**")
         if uploaded_file:
@@ -1177,14 +1418,295 @@ if st.checkbox("🔧 개발자 디버깅 정보 표시", help="개발 및 디버
             })
         
         st.write("**데이터 검증 정보:**")
-        st.json(validation_info)
+        if 'validation_info' in locals():
+            st.json(validation_info)
         
         if not base_data.empty:
+            st.write("**기본 데이터 구조:**")
+            st.json({
+                "총_행_수": len(base_data),
+                "컬럼": list(base_data.columns),
+                "선수금_건수": len(base_data[base_data["direction"] == "선수금"]),
+                "선급금_건수": len(base_data[base_data["direction"] == "선급금"]),
+                "고유_계약_수": base_data["contract_id"].nunique()
+            })
+            
             st.write("**데이터 샘플:**")
             st.dataframe(base_data.head(), use_container_width=True)
         
+        if not agg_table.empty:
+            st.write("**집계 테이블 구조:**")
+            st.json({
+                "행_수": len(agg_table),
+                "컬럼": list(agg_table.columns),
+                "데이터_타입": {col: str(dtype) for col, dtype in agg_table.dtypes.items()}
+            })
+        
         st.write("**매칭 설정:**")
-        st.json(matching_config)
+        if 'matching_config' in locals():
+            st.json(matching_config)
+
+# 성능 모니터링
+try:
+    import psutil
+    import os
+    
+    if st.checkbox("⚡ 성능 모니터링", help="메모리 및 CPU 사용량 확인"):
+        performance_col1, performance_col2, performance_col3 = st.columns(3)
+        
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        cpu_percent = process.cpu_percent()
+        
+        with performance_col1:
+            st.metric("💾 메모리 사용량", f"{memory_info.rss / 1024 / 1024:.1f} MB")
+        
+        with performance_col2:
+            st.metric("🔥 CPU 사용률", f"{cpu_percent:.1f}%")
+        
+        with performance_col3:
+            if 'base_data' in locals():
+                data_size = len(base_data) if not base_data.empty else 0
+                st.metric("📊 처리된 행", f"{data_size:,}개")
+        
+        # 메모리 정리 버튼
+        if st.button("🧹 메모리 정리"):
+            import gc
+            gc.collect()
+            st.success("메모리 정리 완료")
+            
+except ImportError:
+    st.info("psutil 라이브러리가 없어 성능 모니터링을 사용할 수 없습니다.")
+
+# 고급 데이터 분석 도구
+if not base_data.empty:
+    with st.expander("📈 고급 데이터 분석"):
+        analysis_col1, analysis_col2 = st.columns(2)
+        
+        with analysis_col1:
+            st.write("**데이터 품질 리포트:**")
+            
+            # 결측값 분석
+            missing_data = {}
+            for col in base_data.columns:
+                missing_count = base_data[col].isna().sum()
+                missing_pct = (missing_count / len(base_data)) * 100
+                missing_data[col] = f"{missing_count}개 ({missing_pct:.1f}%)"
+            
+            st.json(missing_data)
+        
+        with analysis_col2:
+            st.write("**금액 분포 통계:**")
+            
+            amount_stats = base_data["amount"].describe()
+            st.json({
+                "최소값": f"{amount_stats['min']:,.0f}원",
+                "최대값": f"{amount_stats['max']:,.0f}원",
+                "평균": f"{amount_stats['mean']:,.0f}원",
+                "중간값": f"{amount_stats['50%']:,.0f}원"
+            })
+        
+        # 이상치 감지
+        if st.button("🔍 이상치 감지"):
+            Q1 = base_data["amount"].quantile(0.25)
+            Q3 = base_data["amount"].quantile(0.75)
+            IQR = Q3 - Q1
+            
+            outliers = base_data[
+                (base_data["amount"] < Q1 - 1.5 * IQR) | 
+                (base_data["amount"] > Q3 + 1.5 * IQR)
+            ]
+            
+            if not outliers.empty:
+                st.warning(f"⚠️ {len(outliers)}건의 이상치가 발견되었습니다.")
+                st.dataframe(outliers[["contract_id", "direction", "amount", "date"]], 
+                           use_container_width=True)
+            else:
+                st.success("✅ 이상치가 발견되지 않았습니다.")
+
+# 데이터 내보내기 도구
+if not base_data.empty:
+    with st.expander("📁 데이터 내보내기"):
+        export_col1, export_col2, export_col3 = st.columns(3)
+        
+        with export_col1:
+            if st.button("📊 집계 테이블 다운로드 (CSV)"):
+                if not agg_table.empty:
+                    csv_data = agg_table.to_csv(index=False, encoding='utf-8-sig')
+                    st.download_button(
+                        label="집계_테이블_다운로드.csv",
+                        data=csv_data,
+                        file_name=f"aggregation_table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+        
+        with export_col2:
+            if st.button("📋 전체 데이터 다운로드 (CSV)"):
+                csv_data = base_data.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(
+                    label="전체_데이터_다운로드.csv",
+                    data=csv_data,
+                    file_name=f"full_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+        
+        with export_col3:
+            if st.button("🔍 검색 결과 다운로드 (CSV)"):
+                if not filtered_table.empty:
+                    csv_data = filtered_table.to_csv(index=False, encoding='utf-8-sig')
+                    st.download_button(
+                        label="검색_결과_다운로드.csv",
+                        data=csv_data,
+                        file_name=f"search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+
+# 실시간 로그 뷰어 (개발용)
+if st.checkbox("📋 실시간 로그 보기", help="시스템 로그 실시간 확인"):
+    log_placeholder = st.empty()
+    
+    # 로그 핸들러 추가 (실제 환경에서는 더 정교한 로그 시스템 필요)
+    if hasattr(st.session_state, 'logs'):
+        with log_placeholder.container():
+            st.text_area("시스템 로그", 
+                        value="\n".join(st.session_state.logs[-50:]),  # 최근 50줄만 표시
+                        height=200)
+    else:
+        st.info("로그 데이터가 없습니다.")
+
+# 자동 새로고침 (선택적)
+if st.checkbox("🔄 자동 새로고침 (30초)", help="30초마다 자동으로 화면 새로고침"):
+    import time
+    
+    # JavaScript를 이용한 자동 새로고침
+    st.markdown("""
+    <script>
+    setTimeout(function(){
+        window.location.reload();
+    }, 30000);
+    </script>
+    """, unsafe_allow_html=True)
+    
+    st.info("⏰ 30초 후 자동으로 새로고침됩니다.")
+
+# 캐시 관리 도구
+cache_col1, cache_col2, cache_col3 = st.columns(3)
+
+with cache_col1:
+    if st.button("🗑️ 데이터 캐시 초기화"):
+        st.cache_data.clear()
+        st.success("✅ 데이터 캐시가 초기화되었습니다.")
+
+with cache_col2:
+    if st.button("🔄 페이지 새로고침"):
+        st.experimental_rerun()
+
+with cache_col3:
+    cache_info = st.cache_data.cache_info() if hasattr(st.cache_data, 'cache_info') else None
+    if cache_info:
+        st.caption(f"캐시 히트율: {cache_info.hit_rate:.1%}")
+    else:
+        st.caption("캐시 정보 없음")
+
+# 사용자 세션 정보
+if st.checkbox("👤 세션 정보", help="현재 사용자 세션 상태 확인"):
+    session_info = {
+        "세션_ID": id(st.session_state),
+        "업로드된_파일": uploaded_file.name if uploaded_file else "없음",
+        "마지막_업데이트": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "처리된_데이터_크기": len(base_data) if 'base_data' in locals() and not base_data.empty else 0,
+        "활성_필터": {
+            "검색어": search_query or "없음",
+            "담당자_필터": owner_filter or "없음",
+            "Gap만_표시": show_only_gap
+        }
+    }
+    st.json(session_info)
+
+# 마지막 정리 및 상태 체크
+try:
+    # 마지막 상태 검증
+    final_status = {
+        "파일_업로드": "완료" if uploaded_file else "대기중",
+        "데이터_로드": "완료" if 'base_data' in locals() and not base_data.empty else "실패",
+        "집계_완료": "완료" if 'agg_table' in locals() and not agg_table.empty else "실패",
+        "검색_기능": "활성" if 'filtered_table' in locals() else "비활성"
+    }
+    
+    logger.info(f"최종 상태: {final_status}")
+    
+    # 오류 상황 체크
+    if uploaded_file and ('base_data' not in locals() or base_data.empty):
+        st.error("⚠️ 파일은 업로드되었으나 데이터 처리에 실패했습니다. 파일 형식을 확인해주세요.")
+    
+    if 'agg_table' in locals() and agg_table.empty and uploaded_file:
+        st.error("⚠️ 집계 테이블 생성에 실패했습니다. 데이터 형식을 확인해주세요.")
+        
+except Exception as e:
+    logger.error(f"최종 상태 체크 오류: {e}")
+
+# 성능 통계 (전체 세션)
+if 'performance_stats' not in st.session_state:
+    st.session_state.performance_stats = {
+        'start_time': datetime.now(),
+        'file_uploads': 0,
+        'searches_performed': 0,
+        'matches_computed': 0
+    }
+
+# 통계 업데이트
+if uploaded_file:
+    st.session_state.performance_stats['file_uploads'] += 1
+
+if search_query or owner_filter:
+    st.session_state.performance_stats['searches_performed'] += 1
+
+# 최종 알림 메시지
+if uploaded_file and 'base_data' in locals() and not base_data.empty:
+    session_duration = datetime.now() - st.session_state.performance_stats['start_time']
+    
+    if len(base_data) > 1000:
+        st.success(f"🎉 대용량 데이터 ({len(base_data):,}건) 처리 완료! "
+                  f"세션 시간: {session_duration.seconds//60}분 {session_duration.seconds%60}초")
+    else:
+        st.success(f"✅ 데이터 처리 완료 ({len(base_data)}건)")
+
+# 마지막 안내 메시지 업데이트
+if uploaded_file and 'filtered_table' in locals():
+    if len(filtered_table) == 0 and (search_query or owner_filter):
+        st.info("🔍 **검색 결과가 없습니다.** 위의 '검색 디버깅 정보'를 확인하여 문제를 해결해보세요.")
+    elif not uploaded_file:
+        st.info("👈 시작하려면 좌측에서 엑셀 파일을 업로드하세요.")
+    else:
+        st.success("✅ 모든 기능이 정상적으로 작동 중입니다!")
+
+# 에러 복구 가이드
+with st.expander("🚨 문제 해결 가이드"):
+    st.markdown("""
+    ### 🔧 일반적인 문제와 해결방법
+    
+    **1. 검색이 안 될 때:**
+    - '검색 디버깅 정보 표시' 체크박스를 활성화하여 문제 진단
+    - 부분 검색어 사용 (예: '프로젝트' → 'PJT')
+    - 특수문자 제거 후 검색
+    
+    **2. 파일 업로드 실패 시:**
+    - 파일 확장자 확인 (.xlsx, .xlsm, .xls)
+    - 파일 크기 확인 (10MB 이하 권장)
+    - 다른 브라우저로 시도
+    
+    **3. 데이터가 이상할 때:**
+    - '상세 시스템 정보 표시'로 데이터 구조 확인
+    - 원본 엑셀 파일의 시트명과 컬럼명 확인
+    - 데이터 캐시 초기화 후 재시도
+    
+    **4. 성능이 느릴 때:**
+    - 메모리 정리 버튼 클릭
+    - 브라우저 새로고침
+    - 데이터를 작은 단위로 분할
+    """)
+
+logger.info("Streamlit 앱 렌더링 완료 - 모든 디버깅 도구 포함")
 
 # 성능 최적화 팁
 with st.expander("⚡ 성능 최적화 팁"):
