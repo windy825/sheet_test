@@ -1,4 +1,4 @@
-# app.py — Final Clean Version
+# app.py — CLEAN v3 (one file)
 # ------------------------------------------------------------------
 # - Robust against missing columns/sheets
 # - No unserializable cache returns
@@ -9,33 +9,44 @@
 #   streamlit run app.py
 # ------------------------------------------------------------------
 
-import io, re, math, itertools, typing as t
+import io
+import re
+import math
+import itertools
+import typing as t
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="선수/선급금 계약별 대시보드", layout="wide")
-st.title("📊 선수/선급금 계약별 대시보드 — Final Clean")
+st.title("📊 선수/선급금 계약별 대시보드 — CLEAN v3")
 st.caption("엑셀 업로드 → 표준화 → 집계 → 상세/차트 → 교차검증 자동 매칭")
 
-# ============== Utilities ==============
+# ===================== Utilities =====================
 _non_digit = re.compile(r"[^0-9\-\.]+")
 
 def to_float(x: t.Any) -> float:
-    if x is None or (isinstance(x, float) and math.isnan(x)): return 0.0
-    if isinstance(x, (int, float)): return float(x)
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
     s = str(x).strip()
-    if s == "" or s.lower() in {"nan","none","null"}: return 0.0
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return 0.0
     s = _non_digit.sub("", s)
-    if s in {"","-","."}: return 0.0
-    try: return float(s)
-    except: return 0.0
+    if s in {"", "-", "."}:
+        return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     new_cols, seen = [], set()
     for c in df.columns:
         nc = str(c).strip()
-        nc = re.sub(r"\s+"," ",nc)
+        nc = re.sub(r"\s+", " ", nc)
         if nc in seen:
             k, base = 2, nc
             while nc in seen:
@@ -44,122 +55,215 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
-STANDARD_COLS = ["contract_id","direction","amount","date","party","owner","status","note","overdue_flag"]
-CONTRACT_CANDIDATES = ["계약번호","금형마스터","프로젝트","프로젝트코드","PJT","PJT코드","고유번호","계약코드","계약id"]
-AMOUNT_CANDIDATES  = ["금액","선수금","선급금","선수금금액","선급금금액","합계","잔액"]
-DATE_CANDIDATES    = ["일자","청구일","지급일","납기일","요청일","등록일","기준일","date"]
-PARTY_CANDIDATES   = ["업체명","거래처","고객사","고객명","상대방","회사","vendor","customer"]
-OWNER_CANDIDATES   = ["담당자","담당","담당자명","PM","담당부서","owner"]
-STATUS_CANDIDATES  = ["진행현황","정산여부","상태","status"]
-NOTE_CANDIDATES    = ["비고","메모","특이사항","코멘트","note"]
-OD_CANDIDATES      = ["기한경과","연체","overdue","경과"]
+STANDARD_COLS = [
+    "contract_id", "direction", "amount", "date", "party", "owner", "status", "note", "overdue_flag"
+]
+CONTRACT_CANDIDATES = ["계약번호", "금형마스터", "프로젝트", "프로젝트코드", "PJT", "PJT코드", "고유번호", "계약코드", "계약id"]
+AMOUNT_CANDIDATES  = ["금액", "선수금", "선급금", "선수금금액", "선급금금액", "합계", "잔액"]
+DATE_CANDIDATES    = ["일자", "청구일", "지급일", "납기일", "요청일", "등록일", "기준일", "date"]
+PARTY_CANDIDATES   = ["업체명", "거래처", "고객사", "고객명", "상대방", "회사", "vendor", "customer"]
+OWNER_CANDIDATES   = ["담당자", "담당", "담당자명", "PM", "담당부서", "owner"]
+STATUS_CANDIDATES  = ["진행현황", "정산여부", "상태", "status"]
+NOTE_CANDIDATES    = ["비고", "메모", "특이사항", "코멘트", "note"]
+OD_CANDIDATES      = ["기한경과", "연체", "overdue", "경과"]
+
 
 def first_col(df: pd.DataFrame, candidates: t.List[str]) -> t.Optional[str]:
     cols = list(df.columns)
-    lower_map = {c.lower():c for c in cols}
+    lower_map = {c.lower(): c for c in cols}
     for cand in candidates:
-        if cand in df.columns: return cand
-        if cand.lower() in lower_map: return lower_map[cand.lower()]
+        if cand in df.columns:
+            return cand
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
     for cand in candidates:
         pat = re.compile(re.escape(cand), re.IGNORECASE)
         for c in cols:
-            if pat.search(str(c)): return c
+            if pat.search(str(c)):
+                return c
     return None
 
+
 def read_sheet_by_keywords(excel: pd.ExcelFile, keywords: t.List[str]) -> pd.DataFrame:
-    def _norm(s: str): return re.sub(r"\s+","",s.lower())
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", s.lower())
     target = None
     for name in excel.sheet_names:
         nm = _norm(name)
         if any(_norm(k) in nm for k in keywords):
             target = name; break
-    if target is None: return pd.DataFrame()
+    if target is None:
+        return pd.DataFrame()
     try:
         df = pd.read_excel(excel, sheet_name=target, dtype=str)
         return normalize_columns(df)
-    except: return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
 
 def standardize(df: pd.DataFrame, direction: str) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame(columns=STANDARD_COLS)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=STANDARD_COLS)
     df = normalize_columns(df)
+
     c_contract = first_col(df, CONTRACT_CANDIDATES)
     if c_contract is None:
         for col in df.columns:
-            if any(k in str(col) for k in ["PJT","프로젝트","금형","계약"]):
+            if any(k in str(col) for k in ["PJT", "프로젝트", "금형", "계약"]):
                 c_contract = col; break
-    c_amount  = first_col(df, AMOUNT_CANDIDATES)
-    c_date    = first_col(df, DATE_CANDIDATES)
-    c_party   = first_col(df, PARTY_CANDIDATES)
-    c_owner   = first_col(df, OWNER_CANDIDATES)
-    c_status  = first_col(df, STATUS_CANDIDATES)
-    c_note    = first_col(df, NOTE_CANDIDATES)
-    c_overdue = first_col(df, OD_CANDIDATES)
+
+    c_amount   = first_col(df, AMOUNT_CANDIDATES)
+    c_date     = first_col(df, DATE_CANDIDATES)
+    c_party    = first_col(df, PARTY_CANDIDATES)
+    c_owner    = first_col(df, OWNER_CANDIDATES)
+    c_status   = first_col(df, STATUS_CANDIDATES)
+    c_note     = first_col(df, NOTE_CANDIDATES)
+    c_overdue  = first_col(df, OD_CANDIDATES)
 
     out = pd.DataFrame()
-    out["contract_id"] = df[c_contract].astype(str).str.strip() if c_contract else "(미지정)"
-    out["direction"]   = direction
-    out["amount"]      = df[c_amount].apply(to_float) if c_amount else 0.0
-    out["date"]        = pd.to_datetime(df[c_date], errors="coerce") if c_date else pd.NaT
-    out["party"]       = df[c_party].astype(str).str.strip() if c_party else ""
-    out["owner"]       = df[c_owner].astype(str).str.strip() if c_owner else ""
-    out["status"]      = df[c_status].astype(str).str.strip() if c_status else ""
-    out["note"]        = df[c_note].astype(str).str.strip() if c_note else ""
-    if c_overdue:
+    out["contract_id"] = df[c_contract].astype(str).str.strip() if c_contract in df.columns else "(미지정)"
+    out["direction"] = direction
+    out["amount"] = df[c_amount].apply(to_float) if c_amount in df.columns else 0.0
+    out["date"] = pd.to_datetime(df[c_date], errors="coerce") if c_date in df.columns else pd.NaT
+    out["party"] = df[c_party].astype(str).str.strip() if c_party in df.columns else ""
+    out["owner"] = df[c_owner].astype(str).str.strip() if c_owner in df.columns else ""
+    out["status"] = df[c_status].astype(str).str.strip() if c_status in df.columns else ""
+    out["note"] = df[c_note].astype(str).str.strip() if c_note in df.columns else ""
+
+    if c_overdue in df.columns:
         od = df[c_overdue].astype(str).str.strip().str.lower()
         out["overdue_flag"] = od.isin(["y","yes","true","1","o"]) | od.str.contains("경과|연체|over", na=False)
     else:
         out["overdue_flag"] = False
-    out = out[(out["amount"]!=0) & (out["contract_id"].astype(str).str.strip()!="")]
+
+    out = out[(out["amount"] != 0) & (out["contract_id"].astype(str).str.strip() != "")]
     return out[STANDARD_COLS]
 
-# ============== Load Excel (cache safe) ==============
+# ===================== Cache (DFs only) =====================
 @st.cache_data(show_spinner=True)
 def load_data(file_bytes: bytes):
+    try:
+        import openpyxl  # noqa
+    except ImportError:
+        st.error("openpyxl이 없습니다. 설치: `pip install openpyxl`.")
+        empty = pd.DataFrame(columns=STANDARD_COLS)
+        return empty, pd.DataFrame(), empty, empty
+
     try:
         excel = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     except Exception as e:
         st.error(f"엑셀 열기 실패: {e}")
         empty = pd.DataFrame(columns=STANDARD_COLS)
         return empty, pd.DataFrame(), empty, empty
-    df_r = standardize(read_sheet_by_keywords(excel, ["선수금"]), "선수금")
-    df_a = standardize(read_sheet_by_keywords(excel, ["선급금"]), "선급금")
+
+    df_r_raw = read_sheet_by_keywords(excel, ["선수금"])  # receipts
+    df_a_raw = read_sheet_by_keywords(excel, ["선급금"])  # advances
+
+    df_r = standardize(df_r_raw, "선수금")
+    df_a = standardize(df_a_raw, "선급금")
+
     base = pd.concat([df_r, df_a], ignore_index=True)
+
+    # Aggregate table
     if base.empty:
-        return base, pd.DataFrame(), df_r, df_a
+        table = pd.DataFrame(columns=["계약ID","선수금_합계","선급금_합계","Gap(선수-선급)","담당자","주요거래처","진행현황"]) 
+        return base, table, df_r, df_a
+
     agg_r = base[base["direction"]=="선수금"].groupby("contract_id")["amount"].sum().rename("선수금_합계")
     agg_a = base[base["direction"]=="선급금"].groupby("contract_id")["amount"].sum().rename("선급금_합계")
     agg = pd.concat([agg_r, agg_a], axis=1).fillna(0.0)
     agg["Gap(선수-선급)"] = agg["선수금_합계"] - agg["선급금_합계"]
-    table = agg.reset_index().rename(columns={"contract_id":"계약ID"})
+
+    meta_cols = ["owner","party","status"]
+    meta = base.groupby("contract_id")[meta_cols].agg(lambda s: s.dropna().astype(str).replace({"","nan","None"}, pd.NA).dropna().unique()[:1])
+    for c in meta_cols:
+        meta[c] = meta[c].apply(lambda arr: arr[0] if isinstance(arr,(list,tuple,pd.Series)) and len(arr)>0 else "")
+
+    table = agg.join(meta, how="left").reset_index().rename(columns={
+        "contract_id":"계약ID","owner":"담당자","party":"주요거래처","status":"진행현황"
+    })
     return base, table, df_r, df_a
 
-# ============== Sidebar =================
+# ===================== Sidebar =====================
 with st.sidebar:
     st.header("📁 데이터 업로드")
     upl = st.file_uploader("엑셀 파일 (xlsx/xlsm/xls)", type=["xlsx","xlsm","xls"]) 
-    st.caption("매크로(xlsm)는 값만 읽음")
+    st.caption("매크로(xlsm)는 값만 읽음, 매크로 실행 안 함")
+
     st.header("🔧 매칭 설정")
+    st.caption("계약ID 의존 최소화: 금액/일자/텍스트로 교차검증")
     use_contract_soft = st.checkbox("계약ID 일치 가중치", value=True)
     use_amount = st.checkbox("금액 조건 사용", value=True)
-    amount_tol = st.number_input("금액 허용 오차(원)", 0, 1000000000, 0, step=1000)
+    amount_tol = st.number_input("금액 허용 오차(원)", min_value=0, value=0, step=1000, format="%d")
     amount_tol_pct = st.slider("금액 허용 오차(%)", 0, 20, 1)
     use_date = st.checkbox("일자 조건 사용", value=True)
     date_window = st.slider("일자 윈도우(±일)", 0, 180, 30)
-    use_party_soft = st.checkbox("거래처 텍스트 유사도 가중치", value=True)
-    max_combo = st.slider("부분합 매칭 최대 묶음 수", 1, 5, 3)
+    use_party_soft = st.checkbox("거래처/텍스트 유사도 가중치", value=True)
+    max_combo = st.slider("부분합 매칭 최대 묶음 수(多:1)", 1, 5, 3)
+
+st.markdown("---")
 
 if upl is None:
-    st.info("좌측에서 엑셀 파일을 업로드하세요.")
+    st.info("좌측에서 엑셀 파일을 업로드하세요. 필요시 설치:")
+    st.code("pip install streamlit pandas openpyxl xlrd xlsxwriter", language="bash")
     st.stop()
 
-base, table, receipts, advances = load_data(upl.read())
+file_bytes = upl.read()
+base, table, receipts, advances = load_data(file_bytes)
 
-# ============== KPIs =================
-col1,col2,col3,col4 = st.columns(4)
-with col1: st.metric("총 선수금", f"{base.loc[base['direction']=='선수금','amount'].sum():,.0f} 원")
-with col2: st.metric("총 선급금", f"{base.loc[base['direction']=='선급금','amount'].sum():,.0f} 원")
-with col3: st.metric("Gap", f"{(base.loc[base['direction']=='선수금','amount'].sum()-base.loc[base['direction']=='선급금','amount'].sum()):,.0f} 원")
-with col4: st.metric("계약 수", f"{table.shape[0]:,}")
+# ====== 진단 & 수동 매핑 (업로드했는데 변동 없을 때) ======
+if base.empty:
+    st.warning("업로드된 파일에서 인식된 데이터가 없습니다. 시트/헤더를 수동으로 지정해 보세요.")
+    try:
+        excel_dbg = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        with st.expander("🧪 진단 보기(시트/미리보기)", expanded=False):
+            st.write({"sheets": excel_dbg.sheet_names})
+            for nm in excel_dbg.sheet_names[:5]:
+                try:
+                    preview = pd.read_excel(excel_dbg, sheet_name=nm, nrows=8, header=None)
+                    st.write(f"**{nm}**", preview)
+                except Exception as e:
+                    st.write(f"{nm}: 읽기 실패 - {e}")
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_r = st.selectbox("선수금 시트 선택", ["(없음)"] + excel_dbg.sheet_names, index=0)
+            hdr_r = st.number_input("선수금 헤더 행 번호(0부터)", min_value=0, value=0, step=1)
+        with c2:
+            sel_a = st.selectbox("선급금 시트 선택", ["(없음)"] + excel_dbg.sheet_names, index=0)
+            hdr_a = st.number_input("선급금 헤더 행 번호(0부터)", min_value=0, value=0, step=1)
+        if st.button("수동 매핑으로 다시 불러오기"):
+            df_r_raw = pd.read_excel(excel_dbg, sheet_name=sel_r, dtype=str, header=hdr_r) if sel_r != "(없음)" else pd.DataFrame()
+            df_a_raw = pd.read_excel(excel_dbg, sheet_name=sel_a, dtype=str, header=hdr_a) if sel_a != "(없음)" else pd.DataFrame()
+            receipts = standardize(df_r_raw, "선수금")
+            advances = standardize(df_a_raw, "선급금")
+            base = pd.concat([receipts, advances], ignore_index=True)
+            if base.empty:
+                st.error("여전히 인식된 데이터가 없습니다. 헤더 행 번호를 바꿔보세요 (보통 0~3). 또는 시트 선택을 다시 해보세요.")
+            else:
+                # 재계산
+                agg_r = base[base["direction"]=="선수금"].groupby("contract_id")["amount"].sum().rename("선수금_합계")
+                agg_a = base[base["direction"]=="선급금"].groupby("contract_id")["amount"].sum().rename("선급금_합계")
+                agg = pd.concat([agg_r, agg_a], axis=1).fillna(0.0)
+                agg["Gap(선수-선급)"] = agg["선수금_합계"] - agg["선급금_합계"]
+                meta_cols = ["owner","party","status"]
+                meta = base.groupby("contract_id")[meta_cols].agg(lambda s: s.dropna().astype(str).replace({"","nan","None"}, pd.NA).dropna().unique()[:1])
+                for c in meta_cols:
+                    meta[c] = meta[c].apply(lambda arr: arr[0] if isinstance(arr,(list,tuple,pd.Series)) and len(arr)>0 else "")
+                table = agg.join(meta, how="left").reset_index().rename(columns={"contract_id":"계약ID","owner":"담당자","party":"주요거래처","status":"진행현황"})
+                st.success("수동 매핑으로 데이터 로드 완료! 아래 집계가 갱신되었습니다.")
+
+# ===================== KPIs =====================
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    total_r = base.loc[base["direction"]=="선수금", "amount"].sum()
+    st.metric("총 선수금", f"{total_r:,.0f} 원")
+with col2:
+    total_a = base.loc[base["direction"]=="선급금", "amount"].sum()
+    st.metric("총 선급금", f"{total_a:,.0f} 원")
+with col3:
+    st.metric("Gap(선수-선급)", f"{(total_r-total_a):,.0f} 원")
+with col4:
+    st.metric("계약 수", f"{table.shape[0]:,}")
 
 st.divider()
 
