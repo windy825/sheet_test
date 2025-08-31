@@ -1,27 +1,24 @@
-
 # -*- coding: utf-8 -*-
 """
 streamlit_app.py
-영업 담당자 관점 대시보드 + 매칭/검색 심화 + 커스터마이즈 구현 (핫픽스)
+영업 담당자 관점 대시보드 + 매칭/검색 심화
 
-핫픽스
-- KeyError: '진행현황' 가드 추가 (모든 단계에서 존재 보장)
-- 요일 표기에서 locale 의존 제거 (영문 로케일 미설치 환경 호환)
+개선 사항
+- 👤 영업 대시보드: 현재 시점 기준으로 처리된/처리할/연체/당월예정 KPI 및 차트
+- 🔍 고급 검색: 전역 키워드, 다중 필터(담당자/업체/계약/기간/금액/상태), 결과 내보내기
+- 매칭 탭: 빈 데이터/빈 후보에서도 안전하게 동작
+- 공통 전처리: 컬럼 개행/공백 정규화, 영업담당 표준화, YY/MM 기한 파싱
 
-기능 요약
-- 상태 정의 튜닝(진행현황 반영), 파이프라인 단계(지연/당일/D-3/D-7/당월8+)
-- 권한뷰(본인건만), 고급검색(상태(세부)/파이프라인), 3단 그리드, 주간 계획표
-- 알림 리포트(담당자별 ZIP), Webhook 옵션
-- Streamlit API 변경: width='stretch' 적용
+실행:
+    pip install -r requirements.txt
+    streamlit run streamlit_app.py
 """
 from __future__ import annotations
 
-import io
 import math
 import re
-import zipfile
+from datetime import datetime, date
 from calendar import monthrange
-from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Dict, Optional, Tuple, List
 
@@ -30,6 +27,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# -----------------------------
+# 기본 설정
+# -----------------------------
 st.set_page_config(page_title="선수·선급금 매칭 & 영업 대시보드", layout="wide", page_icon="📊")
 DEFAULT_EXCEL_PATH = "./2025.07월말 선수선급금 현황_20250811.xlsx"
 
@@ -64,6 +64,7 @@ def to_number(x) -> Optional[float]:
             return None
         if isinstance(x, str):
             x = x.replace(",", "").replace(" ", "")
+            # "184-150" 같은 코드 문자열 방지
             if re.search(r"[^\d.\-+]", x):
                 return None
         v = float(x)
@@ -97,15 +98,10 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
         "회수목표일정\n(YY/MM)": "회수목표일정(YY/MM)",
         "경과기간\n(개월)": "경과기간(개월)",
         "영업담당\n(변경시)": "영업담당_변경시",
-        "연락이력": "연락이력",
-        "연락 이력": "연락이력",
-        "진행\n현황": "진행현황",
-        "진행 현황": "진행현황",
     }
     for old, new in mapping.items():
         if old in df.columns and new not in df.columns:
             df.rename(columns={old: new}, inplace=True)
-
     # 영업담당 표준 컬럼
     if "영업담당" in df.columns:
         df["영업담당_표준"] = df["영업담당"]
@@ -113,16 +109,10 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
         df["영업담당_표준"] = df["영업담당_변경시"]
     else:
         df["영업담당_표준"] = None
-
-    # 진행현황/연락이력 기본 보장
-    if "진행현황" not in df.columns:
-        df["진행현황"] = None
-    if "연락이력" not in df.columns:
-        df["연락이력"] = None
-
     return df
 
 def parse_due_yy_mm(val) -> Optional[pd.Timestamp]:
+    """ 'YY/MM' 또는 'YY-MM' 등 기한 문자열을 월 말일로 파싱 """
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
     s = str(val).strip()
@@ -131,8 +121,9 @@ def parse_due_yy_mm(val) -> Optional[pd.Timestamp]:
     m = re.match(r"^\s*(\d{2})[./\- ]?(\d{1,2})\s*$", s)
     if not m:
         return None
-    yy = int(m.group(1)); mm = int(m.group(2))
-    year = 2000 + yy if yy <= 79 else 1900 + yy
+    yy = int(m.group(1))
+    mm = int(m.group(2))
+    year = 2000 + yy if yy <= 79 else 1900 + yy  # 00~79 → 2000~2079, 그 외는 1900대 처리
     mm = max(1, min(12, mm))
     last_day = monthrange(year, mm)[1]
     return pd.Timestamp(year=year, month=mm, day=last_day)
@@ -142,28 +133,17 @@ def add_common_fields(df: pd.DataFrame) -> pd.DataFrame:
         df["금액"] = df.apply(choose_amount_row, axis=1)
     if "전기일" in df.columns and "전기일_parsed" not in df.columns:
         df["전기일_parsed"] = pd.to_datetime(df["전기일"], errors="coerce")
-    # 회수목표일자 보장
-    if "회수목표일자" in df.columns:
-        df["회수목표일자"] = pd.to_datetime(df["회수목표일자"], errors="coerce")
-    elif "회수목표일정(YY/MM)" in df.columns:
+    # 회수목표일정(YY/MM) → due_date
+    if "회수목표일정(YY/MM)" in df.columns and "회수목표일자" not in df.columns:
         df["회수목표일자"] = df["회수목표일정(YY/MM)"].apply(parse_due_yy_mm)
-    else:
-        df["회수목표일자"] = pd.NaT
-    # 정산여부 기반 플래그
+    # 정산 여부 판단 필드
     df["is_settled"] = False
     if "정산여부" in df.columns:
         df["is_settled"] = df["is_settled"] | df["정산여부"].astype(str).str.contains("O", na=False)
     if "정산선수금고유번호" in df.columns:
         df["is_settled"] = df["is_settled"] | df["정산선수금고유번호"].astype(str).str.strip().ne("")
-    # 금액 숫자
+    # 금액 정수화 보조
     df["금액_num"] = df["금액"].apply(to_number)
-    # 진행현황 가드 + 정규화
-    if "진행현황" not in df.columns:
-        df["진행현황"] = None
-    df["진행현황_norm"] = df["진행현황"].astype(str).str.strip().str.lower()
-    # 연락이력 가드
-    if "연락이력" not in df.columns:
-        df["연락이력"] = None
     return df
 
 # -----------------------------
@@ -246,21 +226,23 @@ def calc_match_score(sunsu: pd.Series, seongeup: pd.Series, date_half_life_days:
     return total, parts
 
 # -----------------------------
-# 데이터 준비 & 권한
+# UI: 데이터 업로드
 # -----------------------------
 st.sidebar.header("데이터")
 excel_file = st.sidebar.file_uploader("엑셀 업로드 (.xlsx)", type=["xlsx"], accept_multiple_files=False)
 
+default_used = False
 sheets = {}
-try:
-    if excel_file is not None:
-        sheets = load_excel(excel_file)
-    else:
+if excel_file is not None:
+    sheets = load_excel(excel_file)
+else:
+    try:
         with open(DEFAULT_EXCEL_PATH, "rb") as f:
             sheets = load_excel(f)
+            default_used = True
             st.sidebar.info("기본 경로에서 엑셀을 불러왔습니다.")
-except Exception:
-    st.sidebar.warning("엑셀을 업로드하거나, 리포지토리에 엑셀을 포함시켜 주세요.")
+    except Exception:
+        st.sidebar.warning("엑셀을 업로드하거나, 리포지토리에 엑셀을 포함시켜 주세요.")
 
 if not sheets:
     st.info("데이터가 없어서 기능을 비활성화합니다. 왼쪽에서 엑셀을 업로드하세요.")
@@ -275,108 +257,37 @@ if s_sunsu is None or s_seon is None:
 df_sunsu = sheets[s_sunsu].copy()
 df_seon = sheets[s_seon].copy()
 
-# 권한뷰
-st.sidebar.header("권한/담당자")
-owners_all = sorted(set([x for x in df_sunsu["영업담당_표준"].dropna().unique().tolist() + df_seon["영업담당_표준"].dropna().unique().tolist()]))
-my_only = st.sidebar.checkbox("본인 건만 보기", value=False)
-my_name = st.sidebar.selectbox("내 담당자명", options=["(선택)"] + owners_all, index=0)
-
-def apply_my_view(df: pd.DataFrame) -> pd.DataFrame:
-    if my_only and my_name and my_name != "(선택)":
-        return df[df["영업담당_표준"] == my_name].copy()
-    return df
-
-df_sunsu = apply_my_view(df_sunsu)
-df_seon = apply_my_view(df_seon)
-
-# 공통 필터
+# -----------------------------
+# 사이드바: 필터 프리셋
+# -----------------------------
 st.sidebar.header("공통 필터")
-owner_multi = st.sidebar.multiselect("영업담당 선택(복수)", options=owners_all, default=[])
+owner_all = sorted(set([x for x in df_sunsu["영업담당_표준"].dropna().unique().tolist() + df_seon["영업담당_표준"].dropna().unique().tolist()]))
+owner = st.sidebar.multiselect("영업담당 선택(복수)", options=owner_all, default=[])
 only_unsettled = st.sidebar.checkbox("미정산만 보기", value=False)
 only_overdue = st.sidebar.checkbox("연체만 보기(현재 기준)", value=False)
 
 def apply_owner_status_filter(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if owner_multi:
-        out = out[out["영업담당_표준"].isin(owner_multi)]
+    if owner:
+        out = out[out["영업담당_표준"].isin(owner)]
     if only_unsettled:
         out = out[~out["is_settled"]]
+    # overdue 계산
     now = pd.Timestamp.now()
     if only_overdue:
-        due = out["회수목표일자"] if "회수목표일자" in out.columns else pd.Series(pd.NaT, index=out.index)
-        out = out[(~out["is_settled"]) & (due.notna()) & (due < now)]
+        if "회수목표일자" in out.columns:
+            out = out[(~out["is_settled"]) & (out["회수목표일자"].notna()) & (out["회수목표일자"] < now)]
+        else:
+            out = out[~out["is_settled"]]  # 기한 없으면 미정산으로만 필터
     return out
 
 df_sunsu_f = apply_owner_status_filter(df_sunsu)
 df_seon_f = apply_owner_status_filter(df_seon)
 
 # -----------------------------
-# 상태 정의 튜닝 & 파이프라인
-# -----------------------------
-def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
-    base = df.copy()
-    now = pd.Timestamp.now()
-    this_month = now.to_period("M")
-
-    # 기본 상태
-    base["상태"] = "정보없음"
-    base.loc[base["is_settled"] == True, "상태"] = "처리완료"
-
-    # 기한 시리즈
-    due = base["회수목표일자"] if "회수목표일자" in base.columns else pd.Series(pd.NaT, index=base.index)
-    cond_un = (base["is_settled"] == False)
-    has_due = due.notna()
-
-    base.loc[cond_un & has_due & (due < now), "상태"] = "연체"
-    base.loc[cond_un & has_due & (due.dt.to_period("M") == this_month), "상태"] = "당월예정"
-    base.loc[cond_un & (~has_due), "상태"] = "기한미설정"
-    base.loc[cond_un & has_due & (due.dt.to_period("M") > this_month), "상태"] = "향후예정"
-
-    # 진행현황 기반 세부상태
-    def map_progress(s: str) -> Optional[str]:
-        if not isinstance(s, str): return None
-        t = s.strip().lower()
-        if any(k in t for k in ["회수중", "수금중", "징수중", "collection"]): return "회수중"
-        if any(k in t for k in ["협의", "논의", "컨펌", "조율"]): return "협의중"
-        if any(k in t for k in ["보류", "hold", "대기"]): return "보류"
-        if any(k in t for k in ["소송", "분쟁", "법무"]): return "분쟁/소송"
-        if any(k in t for k in ["무응답", "연락두절"]): return "무응답"
-        return None
-
-    if "진행현황" not in base.columns:
-        base["진행현황"] = None
-
-    base["세부상태"] = base["진행현황"].apply(map_progress)
-    base["상태(세부)"] = base["상태"]
-    mask = base["세부상태"].notna()
-    base.loc[mask, "상태(세부)"] = base.loc[mask, "상태"] + "-" + base.loc[mask, "세부상태"]
-
-    # 파이프라인 스테이지
-    stage = pd.Series("", index=base.index, dtype="object")
-    if "회수목표일자" in base.columns:
-        ddays = (due.dt.normalize() - now.normalize()).dt.days
-        stage[(base["상태"] == "당월예정") & (ddays <= -1)] = "지연"
-        stage[(base["상태"] == "당월예정") & (ddays == 0)] = "당일"
-        stage[(base["상태"] == "당월예정") & (ddays.between(1, 3))] = "D-3"
-        stage[(base["상태"] == "당월예정") & (ddays.between(4, 7))] = "D-7"
-        stage[(base["상태"] == "당월예정") & (ddays >= 8)] = "당월(8일+)"
-    base["파이프라인"] = stage.where(stage != "", other=None)
-
-    if "연락이력" not in base.columns:
-        base["연락이력"] = None
-
-    return base
-
-sunsu_s = enrich_status_pipeline(df_sunsu_f)
-seon_s = enrich_status_pipeline(df_seon_f)
-
-# -----------------------------
 # 탭
 # -----------------------------
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "👤 영업 대시보드", "🔎 매칭 조회", "⚙️ 일괄 매칭", "📊 요약 대시보드",
-    "🧭 고급 검색", "🗂 담당자-고객-계약", "🗓 주간 회수 계획표"
-])
+tab0, tab1, tab2, tab3, tab4 = st.tabs(["👤 영업 대시보드", "🔎 매칭 조회", "⚙️ 일괄 매칭", "📊 요약 대시보드", "🧭 고급 검색"])
 
 # -----------------------------
 # 👤 영업 대시보드
@@ -384,17 +295,33 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 with tab0:
     st.subheader("영업 담당자 관점 KPI & 상태 보드 (현재 시점 기준)")
     now = pd.Timestamp.now()
-    sm = pd.Timestamp(now.year, now.month, 1)
+    this_year = now.year
+    this_month = now.month
+    start_month = pd.Timestamp(year=this_year, month=this_month, day=1)
+    end_month = pd.Timestamp(year=this_year, month=monthrange(this_year, this_month)[1])
+
+    def status_bucket(df: pd.DataFrame) -> pd.DataFrame:
+        base = df.copy()
+        base["상태"] = "정보없음"
+        # 기본 상태
+        base.loc[base["is_settled"] == True, "상태"] = "처리완료"
+        # 미정산 + 기한 존재
+        has_due = base["회수목표일자"].notna() if "회수목표일자" in base.columns else pd.Series(False, index=base.index)
+        cond_un = (base["is_settled"] == False)
+        base.loc[cond_un & has_due & (base["회수목표일자"] < now), "상태"] = "연체"
+        base.loc[cond_un & has_due & (base["회수목표일자"].dt.to_period("M") == start_month.to_period("M")), "상태"] = "당월예정"
+        base.loc[cond_un & (~has_due), "상태"] = "기한미설정"
+        base.loc[cond_un & has_due & (base["회수목표일자"] > end_month), "상태"] = "향후예정"
+        return base
+
+    sunsu_s = status_bucket(df_sunsu_f)
+    seon_s = status_bucket(df_seon_f)
 
     def kpi_block(title: str, df: pd.DataFrame):
-        if df.empty:
-            st.info(f"{title}: 데이터 없음")
-            return
-        due = df["회수목표일자"] if "회수목표일자" in df.columns else pd.Series(pd.NaT, index=df.index)
         total = len(df)
         done = int(df["is_settled"].sum())
-        overdue = int(((~df["is_settled"]) & due.notna() & (due < now)).sum())
-        due_this = int(((~df["is_settled"]) & due.notna() & (due.dt.to_period("M") == sm.to_period("M"))).sum())
+        overdue = int(((~df["is_settled"]) & (df.get("회수목표일자").notna()) & (df["회수목표일자"] < now)).sum())
+        due_this = int(((~df["is_settled"]) & (df.get("회수목표일자").notna()) & (df["회수목표일자"].dt.to_period("M") == start_month.to_period("M"))).sum())
         amt_un = df.loc[~df["is_settled"], "금액_num"].sum(skipna=True)
         cols = st.columns(5)
         with cols[0]: st.metric(f"{title} 건수", f"{total:,}")
@@ -403,19 +330,44 @@ with tab0:
         with cols[3]: st.metric("당월예정", f"{due_this:,}")
         with cols[4]: st.metric("미정산금액", f"{amt_un:,.0f}" if pd.notna(amt_un) else "-")
 
-    st.markdown("### 선수금"); kpi_block("선수금", sunsu_s)
-    st.markdown("### 선급금"); kpi_block("선급금", seon_s)
+    st.markdown("### 선수금")
+    kpi_block("선수금", sunsu_s)
+    st.markdown("### 선급금")
+    kpi_block("선급금", seon_s)
 
+    # 상태별 금액 합계 차트 (담당자 필터 반영)
     def status_chart(df: pd.DataFrame, title: str):
-        if df.empty: st.info(f"{title}: 데이터 없음"); return
-        agg = df.dropna(subset=["금액_num"]).groupby("상태")["금액_num"].sum().reset_index()
-        chart = alt.Chart(agg).mark_bar().encode(x="상태:N", y=alt.Y("금액_num:Q", title="금액 합계")).properties(height=280, title=f"{title} - 상태별 금액")
-        st.altair_chart(chart, width='stretch')
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=240)
+        base = df.copy()
+        base = base.dropna(subset=["금액_num"])
+        agg = base.groupby("상태")["금액_num"].sum().reset_index()
+        chart = alt.Chart(agg).mark_bar().encode(
+            x=alt.X("상태:N", title="상태"),
+            y=alt.Y("금액_num:Q", title="금액 합계")
+        ).properties(height=280, title=f"{title} - 상태별 금액")
+        st.altair_chart(chart, use_container_width=True)
+        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), use_container_width=True, height=240)
 
     c1, c2 = st.columns(2)
     with c1: status_chart(sunsu_s, "선수금")
     with c2: status_chart(seon_s, "선급금")
+
+    # 담당자별 미정산 현황
+    def owner_unsettled(df: pd.DataFrame, title: str):
+        base = df[~df["is_settled"]].copy()
+        if base.empty:
+            st.info(f"{title}: 미정산 없음")
+            return
+        agg = base.groupby("영업담당_표준", dropna=False)["금액_num"].sum().reset_index().sort_values(by="금액_num", ascending=False)
+        chart = alt.Chart(agg.dropna()).mark_bar().encode(
+            x=alt.X("금액_num:Q", title="미정산 금액"),
+            y=alt.Y("영업담당_표준:N", sort="-x", title="영업담당")
+        ).properties(height=360, title=f"{title} - 담당자별 미정산")
+        st.altair_chart(chart, use_container_width=True)
+        st.dataframe(agg.rename(columns={"금액_num": "미정산금액"}), use_container_width=True, height=260)
+
+    c3, c4 = st.columns(2)
+    with c3: owner_unsettled(sunsu_s, "선수금")
+    with c4: owner_unsettled(seon_s, "선급금")
 
 # -----------------------------
 # 🔎 매칭 조회
@@ -437,8 +389,8 @@ with tab1:
             dstr = datev.strftime("%Y-%m-%d") if isinstance(datev, pd.Timestamp) else (str(datev) if datev is not None else "")
             return f"[{gid}] {comp} | 계약:{contract} | 일자:{dstr} | 금액:{amt_str}"
 
-        options = df_sunsu_f.index.tolist()
-        selectable = [(i, sunsu_label(df_sunsu_f.loc[i])) for i in options]
+        sunsu_options = df_sunsu_f.index.tolist()
+        selectable = [(i, sunsu_label(df_sunsu_f.loc[i])) for i in sunsu_options]
         selected_idx = st.selectbox("선수금 선택", options=[i for i, _ in selectable], format_func=lambda i: dict(selectable)[i])
 
         if selected_idx is not None:
@@ -448,12 +400,17 @@ with tab1:
                 total, parts = calc_match_score(target_row, row, date_half_life_days=date_half_life_days)
                 if total >= score_threshold:
                     scores.append({
-                        "선급_index": i, "총점": round(total, 2),
+                        "선급_index": i,
+                        "총점": round(total, 2),
                         **{f"점수:{k}": round(v, 2) for k, v in parts.items()},
-                        "계약번호": row.get("계약번호"), "업체명": row.get("업체명"),
-                        "전기일": row.get("전기일_parsed", row.get("전기일")), "금액": row.get("금액_num"),
-                        "정산선수금고유번호": row.get("정산선수금고유번호"), "텍스트": row.get("텍스트"),
-                        "고유넘버": row.get("고유넘버"), "영업담당": row.get("영업담당_표준"),
+                        "계약번호": row.get("계약번호"),
+                        "업체명": row.get("업체명"),
+                        "전기일": row.get("전기일_parsed", row.get("전기일")),
+                        "금액": row.get("금액_num"),
+                        "정산선수금고유번호": row.get("정산선수금고유번호"),
+                        "텍스트": row.get("텍스트"),
+                        "고유넘버": row.get("고유넘버"),
+                        "영업담당": row.get("영업담당_표준"),
                     })
             if not scores:
                 st.info("후보가 없습니다. 점수 임계값 또는 필터를 조정해 주세요.")
@@ -461,7 +418,7 @@ with tab1:
                 cand_df = pd.DataFrame(scores)
                 if "총점" in cand_df.columns:
                     cand_df = cand_df.sort_values(by=["총점"], ascending=False).reset_index(drop=True)
-                st.dataframe(cand_df, width='stretch', height=430)
+                st.dataframe(cand_df, use_container_width=True, height=430)
 
 # -----------------------------
 # ⚙️ 일괄 매칭
@@ -469,17 +426,19 @@ with tab1:
 with tab2:
     st.subheader("일괄 매칭 제안(Top-1)")
     score_threshold2 = st.slider("후보 표시 최소점수", 0, 100, 40, 5, key="b_th")
-    limit = st.number_input("대상 선수금 수", min_value=10, max_value=max(10, len(df_sunsu_f) if len(df_sunsu_f)>0 else 10), value=min(200, len(df_sunsu_f) if len(df_sunsu_f)>0 else 10), step=10)
+    limit = st.number_input("대상 선수금 수", min_value=10, max_value=10000, value=200, step=10)
     if df_sunsu_f.empty or df_seon_f.empty:
         st.info("데이터가 비어 있어 일괄 제안을 생략합니다.")
     else:
         rows = []
         for si, srow in df_sunsu_f.head(int(limit)).iterrows():
-            best_score = -1.0; best_idx = None
+            best_score = -1.0
+            best_idx = None
             for ei, erow in df_seon_f.iterrows():
                 total, _ = calc_match_score(srow, erow, date_half_life_days=90)
                 if total > best_score:
-                    best_score = total; best_idx = ei
+                    best_score = total
+                    best_idx = ei
             if best_idx is not None and best_score >= score_threshold2:
                 erow = df_seon_f.loc[best_idx]
                 rows.append({
@@ -497,7 +456,7 @@ with tab2:
             st.info("제안 가능한 매칭이 없습니다.")
         else:
             dfb = pd.DataFrame(rows).sort_values(by="총점", ascending=False).reset_index(drop=True)
-            st.dataframe(dfb, width='stretch', height=450)
+            st.dataframe(dfb, use_container_width=True, height=450)
             st.download_button("CSV 다운로드", dfb.to_csv(index=False).encode("utf-8-sig"), file_name="batch_match_suggestions.csv", mime="text/csv")
 
 # -----------------------------
@@ -506,22 +465,33 @@ with tab2:
 with tab3:
     st.subheader("요약 지표 & 시각화")
     def group_unsettled(df: pd.DataFrame, title: str):
-        base = df[~df["is_settled"]].copy().dropna(subset=["금액_num"])
-        if base.empty: st.info(f"{title}: 미정산 없음"); return
+        base = df[~df["is_settled"]].copy()
+        base = base.dropna(subset=["금액_num"])
         agg = base.groupby("업체명", dropna=False)["금액_num"].sum().reset_index().sort_values(by="금액_num", ascending=False).head(20)
         st.markdown(f"**{title} - 미정산 금액 상위 20 업체**")
-        chart = alt.Chart(agg.dropna()).mark_bar().encode(x=alt.X("금액_num:Q", title="금액 합계"), y=alt.Y("업체명:N", sort="-x", title="업체명")).properties(height=360)
-        st.altair_chart(chart, width='stretch')
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=260)
+        chart = alt.Chart(agg.dropna()).mark_bar().encode(
+            x=alt.X("금액_num:Q", title="금액 합계"),
+            y=alt.Y("업체명:N", sort="-x", title="업체명")
+        ).properties(height=360)
+        st.altair_chart(chart, use_container_width=True)
+        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), use_container_width=True, height=260)
 
     c1, c2 = st.columns(2)
-    with c1: group_unsettled(sunsu_s, "선수금")
-    with c2: group_unsettled(seon_s, "선급금")
+    with c1:
+        if not df_sunsu_f.empty: group_unsettled(df_sunsu_f, "선수금")
+        else: st.info("선수금 데이터 없음")
+    with c2:
+        if not df_seon_f.empty: group_unsettled(df_seon_f, "선급금")
+        else: st.info("선급금 데이터 없음")
 
+    # 에이징
     def aging_chart(df: pd.DataFrame, title: str):
         col = "경과기간(개월)" if "경과기간(개월)" in df.columns else None
-        if col is None or df.empty: st.info(f"{title}: '경과기간(개월)' 컬럼이 없어 에이징 차트를 생략합니다."); return
-        base = df.dropna(subset=["금액_num"]).copy()
+        if col is None or df.empty:
+            st.info(f"{title}: '경과기간(개월)' 컬럼이 없어 에이징 차트를 생략합니다.")
+            return
+        base = df.copy()
+        base = base.dropna(subset=["금액_num"])
         def bucket(x):
             try: v = float(x)
             except Exception: return "미상"
@@ -534,51 +504,72 @@ with tab3:
         base["버킷"] = base[col].apply(bucket)
         agg = base.groupby("버킷")["금액_num"].sum().reset_index()
         order = ["0-1개월", "1-3개월", "3-6개월", "6-12개월", "12-24개월", "24개월+"]
-        agg["버킷"] = pd.Categorical(agg["버킷"], categories=order, ordered=True); agg = agg.sort_values("버킷")
-        chart = alt.Chart(agg).mark_bar().encode(x=alt.X("버킷:N", sort=order, title="경과기간 버킷"), y=alt.Y("금액_num:Q", title="금액 합계")).properties(height=300)
+        agg["버킷"] = pd.Categorical(agg["버킷"], categories=order, ordered=True)
+        agg = agg.sort_values("버킷")
+        chart = alt.Chart(agg).mark_bar().encode(
+            x=alt.X("버킷:N", sort=order, title="경과기간 버킷"),
+            y=alt.Y("금액_num:Q", title="금액 합계")
+        ).properties(height=300)
         st.markdown(f"**{title} - 에이징(개월) 분포**")
-        st.altair_chart(chart, width='stretch')
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=240)
+        st.altair_chart(chart, use_container_width=True)
+        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), use_container_width=True, height=240)
 
     c3, c4 = st.columns(2)
-    with c3: aging_chart(sunsu_s, "선수금")
-    with c4: aging_chart(seon_s, "선급금")
+    with c3: aging_chart(df_sunsu_f, "선수금")
+    with c4: aging_chart(df_seon_f, "선급금")
 
 # -----------------------------
 # 🧭 고급 검색
 # -----------------------------
 with tab4:
     st.subheader("강화된 검색(선수금/선급금 통합)")
-    sunsu_view = sunsu_s.copy(); sunsu_view["구분"] = "선수금"
-    seon_view = seon_s.copy();   seon_view["구분"] = "선급금"
+
+    # 통합 뷰
+    sunsu_view = df_sunsu_f.copy()
+    sunsu_view["구분"] = "선수금"
+    seon_view = df_seon_f.copy()
+    seon_view["구분"] = "선급금"
     all_view = pd.concat([sunsu_view, seon_view], ignore_index=True, sort=False)
 
+    # 필터 UI
     col1, col2, col3 = st.columns(3)
-    with col1: kw = st.text_input("키워드(업체/계약/텍스트/전표번호/금형/고유넘버)", value="")
-    with col2: min_amt = st.number_input("최소 금액", value=0, step=1000)
-    with col3: max_amt = st.number_input("최대 금액(0=제한없음)", value=0, step=1000)
+    with col1:
+        kw = st.text_input("키워드(업체/계약/텍스트/전표번호/금형/고유넘버)", value="")
+    with col2:
+        min_amt = st.number_input("최소 금액", value=0, step=1000)
+    with col3:
+        max_amt = st.number_input("최대 금액(0=제한없음)", value=0, step=1000)
 
     col4, col5, col6 = st.columns(3)
-    with col4: start_date = st.date_input("전기일 From", value=None)
-    with col5: end_date = st.date_input("전기일 To", value=None)
-    with col6: only_due_this_month = st.checkbox("당월예정만", value=False)
+    with col4:
+        start_date = st.date_input("전기일 From", value=None)
+    with col5:
+        end_date = st.date_input("전기일 To", value=None)
+    with col6:
+        only_due_this_month = st.checkbox("당월예정만", value=False)
 
-    col7, col8 = st.columns(2)
-    with col7: status_sel = st.multiselect("상태(세부) 선택", options=sorted(all_view["상태(세부)"].dropna().unique().tolist()), default=[])
-    with col8: pipeline_sel = st.multiselect("파이프라인 단계 선택", options=[x for x in ["지연","당일","D-3","D-7","당월(8일+)"] if x in all_view["파이프라인"].dropna().unique()], default=[])
-
+    # 적용
     res = all_view.copy()
+
+    # 금액 필터
     res = res[(res["금액_num"].fillna(0) >= (min_amt or 0))]
-    if max_amt and max_amt > 0: res = res[(res["금액_num"].fillna(0) <= max_amt)]
-    if start_date: res = res[res["전기일_parsed"].fillna(pd.Timestamp("1900-01-01")) >= pd.Timestamp(start_date)]
-    if end_date:   res = res[res["전기일_parsed"].fillna(pd.Timestamp("2999-12-31")) <= pd.Timestamp(end_date)]
+    if max_amt and max_amt > 0:
+        res = res[(res["금액_num"].fillna(0) <= max_amt)]
+
+    # 날짜 필터
+    if start_date:
+        sdt = pd.Timestamp(start_date)
+        res = res[res["전기일_parsed"].fillna(pd.Timestamp("1900-01-01")) >= sdt]
+    if end_date:
+        edt = pd.Timestamp(end_date)
+        res = res[res["전기일_parsed"].fillna(pd.Timestamp("2999-12-31")) <= edt]
+
+    # 당월예정
     if only_due_this_month:
         now = pd.Timestamp.now()
-        due = res["회수목표일자"]
-        res = res[(~res["is_settled"]) & (due.notna()) & (due.dt.to_period("M") == now.to_period("M"))]
-    if status_sel:   res = res[res["상태(세부)"].isin(status_sel)]
-    if pipeline_sel: res = res[res["파이프라인"].isin(pipeline_sel)]
+        res = res[(~res["is_settled"]) & (res["회수목표일자"].notna()) & (res["회수목표일자"].dt.to_period("M") == now.to_period("M"))]
 
+    # 키워드(contains, 대소문자 무시)
     if kw.strip():
         k = kw.strip().upper()
         def contains_any(s):
@@ -586,99 +577,16 @@ with tab4:
             return k in str(s).upper()
         search_cols = [c for c in ["업체명","계약번호","텍스트","전표번호","금형마스터","금형마스터내역","고유넘버"] if c in res.columns]
         mask = False
-        for c in search_cols: mask = mask | res[c].apply(contains_any)
+        for c in search_cols:
+            mask = mask | res[c].apply(contains_any)
         res = res[mask]
 
+    # 정렬 & 표시
     sort_cols = [c for c in ["구분","is_settled","회수목표일자","전기일_parsed","금액_num"] if c in res.columns]
-    if sort_cols: res = res.sort_values(by=sort_cols, ascending=[True, True, True, True, False]).reset_index(drop=True)
-    show_cols = [c for c in ["구분","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","정산선수금고유번호","정산여부","진행현황","연락이력","텍스트"] if c in res.columns]
-    st.dataframe(res[show_cols], width='stretch', height=520)
+    if sort_cols:
+        res = res.sort_values(by=sort_cols, ascending=[True, True, True, True, False]).reset_index(drop=True)
+    show_cols = [c for c in ["구분","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","금액_num","정산선수금고유번호","정산여부","진행현황","텍스트"] if c in res.columns]
+    st.dataframe(res[show_cols], use_container_width=True, height=520)
     st.download_button("검색결과 CSV 다운로드", res[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="search_results.csv", mime="text/csv")
 
-# -----------------------------
-# 🗂 담당자-고객-계약 (3단 그리드)
-# -----------------------------
-with tab5:
-    st.subheader("담당자 → 고객 → 계약 3단 그리드")
-    all3 = pd.concat([sunsu_s.assign(구분="선수금"), seon_s.assign(구분="선급금")], ignore_index=True, sort=False)
-    if all3.empty:
-        st.info("데이터 없음")
-    else:
-        owners = sorted(all3["영업담당_표준"].dropna().unique().tolist())
-        for owner in owners:
-            with st.expander(f"담당자: {owner}"):
-                sub = all3[all3["영업담당_표준"] == owner].copy()
-                customers = sorted(sub["업체명"].dropna().unique().tolist())
-                for cust in customers:
-                    st.markdown(f"**고객: {cust}**")
-                    sub2 = sub[sub["업체명"] == cust].copy()
-                    cols = [c for c in ["계약번호","구분","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","진행현황","연락이력","텍스트"] if c in sub2.columns]
-                    st.dataframe(sub2[cols], width='stretch', height=240)
-
-# -----------------------------
-# 🗓 주간 회수 계획표
-# -----------------------------
-with tab6:
-    st.subheader("주간 회수 계획표 (미정산 + 이번주 기한/지연 포함)")
-    now = pd.Timestamp.now().normalize()
-    week_start = now - pd.Timedelta(days=now.weekday())  # 월요일
-    week_end = week_start + pd.Timedelta(days=6)
-
-    def weekly_plan(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty: return df
-        due = df["회수목표일자"]
-        cond = (~df["is_settled"]) & (due.notna()) & ((due < week_start) | ((due >= week_start) & (due <= week_end)))
-        out = df[cond].copy()
-        # locale 의존 대신 수동 매핑
-        weekday = out["회수목표일자"].dt.weekday
-        names = {0:"월",1:"화",2:"수",3:"목",4:"금",5:"토",6:"일"}
-        out["요일"] = weekday.map(names)
-        return out
-
-    week_all = pd.concat([weekly_plan(sunsu_s.assign(구분="선수금")), weekly_plan(seon_s.assign(구분="선급금"))], ignore_index=True, sort=False)
-    if week_all.empty:
-        st.info("이번 주 계획 대상이 없습니다.")
-    else:
-        show_cols = [c for c in ["요일","구분","영업담당_표준","업체명","계약번호","고유넘버","회수목표일자","파이프라인","상태(세부)","금액_num","연락이력","텍스트"] if c in week_all.columns]
-        week_all = week_all.sort_values(by=["요일","영업담당_표준","업체명","계약번호"])
-        st.dataframe(week_all[show_cols], width='stretch', height=520)
-        st.download_button("주간 계획표 CSV 다운로드", week_all[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="weekly_collection_plan.csv", mime="text/csv")
-
-# -----------------------------
-# 📣 알림 리포트 (CSV ZIP / Webhook)
-# -----------------------------
-st.markdown("---")
-st.subheader("📣 알림 리포트: 영업담당별 당월예정/연체 목록")
-def build_alert_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    return df[(~df["is_settled"]) & (df["상태"].isin(["연체","당월예정"]))][["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","연락이력","텍스트"]].copy()
-
-alert_all = pd.concat([build_alert_df(sunsu_s.assign(구분="선수금")), build_alert_df(seon_s.assign(구분="선급금"))], ignore_index=True, sort=False)
-if alert_all.empty:
-    st.info("알림 대상(당월예정/연체)이 없습니다.")
-else:
-    # ZIP per owner
-    owners = sorted(alert_all["영업담당_표준"].dropna().unique().tolist())
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for o in owners:
-            sub = alert_all[alert_all["영업담당_표준"] == o].copy()
-            if sub.empty: continue
-            csv_bytes = sub.to_csv(index=False).encode("utf-8-sig")
-            zf.writestr(f"{o}_알림대상.csv", csv_bytes)
-    mem.seek(0)
-    st.download_button("담당자별 알림 CSV(zip) 다운로드", data=mem, file_name="alerts_by_owner.zip", mime="application/zip")
-
-    st.markdown("**옵션: Webhook URL로 간단 메시지 전송(실험적)**")
-    webhook = st.text_input("Webhook URL 입력(예: Slack Incoming Webhook)", value="", type="password")
-    if webhook:
-        try:
-            import requests
-            summary = alert_all.groupby(["구분","상태"]).size().reset_index(name="건수")
-            text_lines = ["[알림 요약]"] + [f"{r['구분']} - {r['상태']}: {int(r['건수'])}건" for _, r in summary.iterrows()]
-            resp = requests.post(webhook, json={"text": "\n".join(text_lines)}, timeout=5)
-            st.success(f"Webhook 전송 결과: {resp.status_code}")
-        except Exception as e:
-            st.warning(f"Webhook 전송 실패: {e}")
-
-st.caption("ⓘ 컬럼이 없어도 안전하게 동작하도록 모든 단계에서 가드를 추가했습니다. 요일 표기는 locale 없이 동작합니다.")
+st.caption("ⓘ 담당자/상태 중심 KPI·차트, 통합 검색 강화 완료. 필요 시 상태 정의/가중치/컬럼 매핑 커스터마이즈 가능.")
