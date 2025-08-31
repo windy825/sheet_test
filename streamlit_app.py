@@ -752,7 +752,7 @@ def build_alert_df(df: pd.DataFrame) -> pd.DataFrame:
     desired = ["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","정산진행현황","연락이력","텍스트","비고","구분"]
     cols = [c for c in desired if c in base.columns]
     base = base[cols]
-    return base
+    return base 
 
 alert_all = pd.concat([build_alert_df(sunsu_s.assign(구분="선수금")), build_alert_df(seon_s.assign(구분="선급금"))], ignore_index=True, sort=False)
 if alert_all.empty:
