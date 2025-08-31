@@ -2,17 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 streamlit_app.py
-영업 담당자 관점 대시보드 + 매칭/검색 심화 + 커스터마이즈 구현 (핫픽스)
-
-핫픽스
-- KeyError: '진행현황' 가드 추가 (모든 단계에서 존재 보장)
-- 요일 표기에서 locale 의존 제거 (영문 로케일 미설치 환경 호환)
-
-기능 요약
-- 상태 정의 튜닝(진행현황 반영), 파이프라인 단계(지연/당일/D-3/D-7/당월8+)
-- 권한뷰(본인건만), 고급검색(상태(세부)/파이프라인), 3단 그리드, 주간 계획표
-- 알림 리포트(담당자별 ZIP), Webhook 옵션
-- Streamlit API 변경: width='stretch' 적용
+핫픽스 + 가독성 개선
+- 주간 계획표: '회수목표일자' KeyError 가드
+- 금액 표시: 원(정수) + 3자리 콤마 표기(모든 테이블 공통)
+- 이전에 구현한 기능(상태 튜닝/파이프라인/권한뷰/검색/3단 그리드/알림/차트) 유지
 """
 from __future__ import annotations
 
@@ -21,7 +14,6 @@ import math
 import re
 import zipfile
 from calendar import monthrange
-from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Dict, Optional, Tuple, List
 
@@ -106,7 +98,6 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
         if old in df.columns and new not in df.columns:
             df.rename(columns={old: new}, inplace=True)
 
-    # 영업담당 표준 컬럼
     if "영업담당" in df.columns:
         df["영업담당_표준"] = df["영업담당"]
     elif "영업담당_변경시" in df.columns:
@@ -114,11 +105,8 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["영업담당_표준"] = None
 
-    # 진행현황/연락이력 기본 보장
-    if "진행현황" not in df.columns:
-        df["진행현황"] = None
-    if "연락이력" not in df.columns:
-        df["연락이력"] = None
+    if "진행현황" not in df.columns: df["진행현황"] = None
+    if "연락이력" not in df.columns: df["연락이력"] = None
 
     return df
 
@@ -142,33 +130,23 @@ def add_common_fields(df: pd.DataFrame) -> pd.DataFrame:
         df["금액"] = df.apply(choose_amount_row, axis=1)
     if "전기일" in df.columns and "전기일_parsed" not in df.columns:
         df["전기일_parsed"] = pd.to_datetime(df["전기일"], errors="coerce")
-    # 회수목표일자 보장
     if "회수목표일자" in df.columns:
         df["회수목표일자"] = pd.to_datetime(df["회수목표일자"], errors="coerce")
     elif "회수목표일정(YY/MM)" in df.columns:
         df["회수목표일자"] = df["회수목표일정(YY/MM)"].apply(parse_due_yy_mm)
     else:
         df["회수목표일자"] = pd.NaT
-    # 정산여부 기반 플래그
     df["is_settled"] = False
     if "정산여부" in df.columns:
         df["is_settled"] = df["is_settled"] | df["정산여부"].astype(str).str.contains("O", na=False)
     if "정산선수금고유번호" in df.columns:
         df["is_settled"] = df["is_settled"] | df["정산선수금고유번호"].astype(str).str.strip().ne("")
-    # 금액 숫자
     df["금액_num"] = df["금액"].apply(to_number)
-    # 진행현황 가드 + 정규화
-    if "진행현황" not in df.columns:
-        df["진행현황"] = None
+    if "진행현황" not in df.columns: df["진행현황"] = None
     df["진행현황_norm"] = df["진행현황"].astype(str).str.strip().str.lower()
-    # 연락이력 가드
-    if "연락이력" not in df.columns:
-        df["연락이력"] = None
+    if "연락이력" not in df.columns: df["연락이력"] = None
     return df
 
-# -----------------------------
-# 데이터 로드
-# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_excel(excel_bytes_or_path) -> Dict[str, pd.DataFrame]:
     if excel_bytes_or_path is None:
@@ -246,7 +224,28 @@ def calc_match_score(sunsu: pd.Series, seongeup: pd.Series, date_half_life_days:
     return total, parts
 
 # -----------------------------
-# 데이터 준비 & 권한
+# 공통 표현: 금액 포맷 (정수 원, 콤마)
+# -----------------------------
+def _money_like(col: str, dtype) -> bool:
+    if "금액" in col or "합계" in col or col in ["금액_num", "금액"]:
+        return True
+    return False
+
+def display_df(df: pd.DataFrame, height: int = 420):
+    """모든 테이블 표시에 공통 적용: 금액류를 정수 원으로, 3자리 콤마"""
+    df2 = df.copy()
+    money_cols = [c for c in df2.columns if _money_like(c, df2[c].dtype)]
+    for c in money_cols:
+        df2[c] = pd.to_numeric(df2[c], errors="coerce").round(0).astype("Int64")
+    # column_config 라벨 치환
+    config = {}
+    for c in money_cols:
+        label = "금액(원)" if c == "금액_num" else c
+        config[c] = st.column_config.NumberColumn(label, format="%,d")
+    st.dataframe(df2, width='stretch', height=height, column_config=config)
+
+# -----------------------------
+# 데이터 로드 & 권한
 # -----------------------------
 st.sidebar.header("데이터")
 excel_file = st.sidebar.file_uploader("엑셀 업로드 (.xlsx)", type=["xlsx"], accept_multiple_files=False)
@@ -311,18 +310,15 @@ df_sunsu_f = apply_owner_status_filter(df_sunsu)
 df_seon_f = apply_owner_status_filter(df_seon)
 
 # -----------------------------
-# 상태 정의 튜닝 & 파이프라인
+# 상태 정의 & 파이프라인
 # -----------------------------
 def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     base = df.copy()
     now = pd.Timestamp.now()
     this_month = now.to_period("M")
 
-    # 기본 상태
     base["상태"] = "정보없음"
     base.loc[base["is_settled"] == True, "상태"] = "처리완료"
-
-    # 기한 시리즈
     due = base["회수목표일자"] if "회수목표일자" in base.columns else pd.Series(pd.NaT, index=base.index)
     cond_un = (base["is_settled"] == False)
     has_due = due.notna()
@@ -332,7 +328,6 @@ def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     base.loc[cond_un & (~has_due), "상태"] = "기한미설정"
     base.loc[cond_un & has_due & (due.dt.to_period("M") > this_month), "상태"] = "향후예정"
 
-    # 진행현황 기반 세부상태
     def map_progress(s: str) -> Optional[str]:
         if not isinstance(s, str): return None
         t = s.strip().lower()
@@ -343,15 +338,12 @@ def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
         if any(k in t for k in ["무응답", "연락두절"]): return "무응답"
         return None
 
-    if "진행현황" not in base.columns:
-        base["진행현황"] = None
-
+    if "진행현황" not in base.columns: base["진행현황"] = None
     base["세부상태"] = base["진행현황"].apply(map_progress)
     base["상태(세부)"] = base["상태"]
     mask = base["세부상태"].notna()
     base.loc[mask, "상태(세부)"] = base.loc[mask, "상태"] + "-" + base.loc[mask, "세부상태"]
 
-    # 파이프라인 스테이지
     stage = pd.Series("", index=base.index, dtype="object")
     if "회수목표일자" in base.columns:
         ddays = (due.dt.normalize() - now.normalize()).dt.days
@@ -362,8 +354,7 @@ def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
         stage[(base["상태"] == "당월예정") & (ddays >= 8)] = "당월(8일+)"
     base["파이프라인"] = stage.where(stage != "", other=None)
 
-    if "연락이력" not in base.columns:
-        base["연락이력"] = None
+    if "연락이력" not in base.columns: base["연락이력"] = None
 
     return base
 
@@ -411,7 +402,7 @@ with tab0:
         agg = df.dropna(subset=["금액_num"]).groupby("상태")["금액_num"].sum().reset_index()
         chart = alt.Chart(agg).mark_bar().encode(x="상태:N", y=alt.Y("금액_num:Q", title="금액 합계")).properties(height=280, title=f"{title} - 상태별 금액")
         st.altair_chart(chart, use_container_width=True)
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=240)
+        display_df(agg.rename(columns={"금액_num": "금액합계"}), height=240)
 
     c1, c2 = st.columns(2)
     with c1: status_chart(sunsu_s, "선수금")
@@ -458,10 +449,8 @@ with tab1:
             if not scores:
                 st.info("후보가 없습니다. 점수 임계값 또는 필터를 조정해 주세요.")
             else:
-                cand_df = pd.DataFrame(scores)
-                if "총점" in cand_df.columns:
-                    cand_df = cand_df.sort_values(by=["총점"], ascending=False).reset_index(drop=True)
-                st.dataframe(cand_df, width='stretch', height=430)
+                cand_df = pd.DataFrame(scores).sort_values(by="총점", ascending=False).reset_index(drop=True)
+                display_df(cand_df, height=430)
 
 # -----------------------------
 # ⚙️ 일괄 매칭
@@ -497,7 +486,7 @@ with tab2:
             st.info("제안 가능한 매칭이 없습니다.")
         else:
             dfb = pd.DataFrame(rows).sort_values(by="총점", ascending=False).reset_index(drop=True)
-            st.dataframe(dfb, width='stretch', height=450)
+            display_df(dfb, height=450)
             st.download_button("CSV 다운로드", dfb.to_csv(index=False).encode("utf-8-sig"), file_name="batch_match_suggestions.csv", mime="text/csv")
 
 # -----------------------------
@@ -512,7 +501,7 @@ with tab3:
         st.markdown(f"**{title} - 미정산 금액 상위 20 업체**")
         chart = alt.Chart(agg.dropna()).mark_bar().encode(x=alt.X("금액_num:Q", title="금액 합계"), y=alt.Y("업체명:N", sort="-x", title="업체명")).properties(height=360)
         st.altair_chart(chart, use_container_width=True)
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=260)
+        display_df(agg.rename(columns={"금액_num": "금액합계"}), height=260)
 
     c1, c2 = st.columns(2)
     with c1: group_unsettled(sunsu_s, "선수금")
@@ -538,7 +527,7 @@ with tab3:
         chart = alt.Chart(agg).mark_bar().encode(x=alt.X("버킷:N", sort=order, title="경과기간 버킷"), y=alt.Y("금액_num:Q", title="금액 합계")).properties(height=300)
         st.markdown(f"**{title} - 에이징(개월) 분포**")
         st.altair_chart(chart, use_container_width=True)
-        st.dataframe(agg.rename(columns={"금액_num": "금액합계"}), width='stretch', height=240)
+        display_df(agg.rename(columns={"금액_num": "금액합계"}), height=240)
 
     c3, c4 = st.columns(2)
     with c3: aging_chart(sunsu_s, "선수금")
@@ -574,7 +563,7 @@ with tab4:
     if end_date:   res = res[res["전기일_parsed"].fillna(pd.Timestamp("2999-12-31")) <= pd.Timestamp(end_date)]
     if only_due_this_month:
         now = pd.Timestamp.now()
-        due = res["회수목표일자"]
+        due = res["회수목표일자"] if "회수목표일자" in res.columns else pd.Series(pd.NaT, index=res.index)
         res = res[(~res["is_settled"]) & (due.notna()) & (due.dt.to_period("M") == now.to_period("M"))]
     if status_sel:   res = res[res["상태(세부)"].isin(status_sel)]
     if pipeline_sel: res = res[res["파이프라인"].isin(pipeline_sel)]
@@ -592,7 +581,7 @@ with tab4:
     sort_cols = [c for c in ["구분","is_settled","회수목표일자","전기일_parsed","금액_num"] if c in res.columns]
     if sort_cols: res = res.sort_values(by=sort_cols, ascending=[True, True, True, True, False]).reset_index(drop=True)
     show_cols = [c for c in ["구분","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","정산선수금고유번호","정산여부","진행현황","연락이력","텍스트"] if c in res.columns]
-    st.dataframe(res[show_cols], width='stretch', height=520)
+    display_df(res[show_cols], height=520)
     st.download_button("검색결과 CSV 다운로드", res[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="search_results.csv", mime="text/csv")
 
 # -----------------------------
@@ -613,7 +602,7 @@ with tab5:
                     st.markdown(f"**고객: {cust}**")
                     sub2 = sub[sub["업체명"] == cust].copy()
                     cols = [c for c in ["계약번호","구분","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","진행현황","연락이력","텍스트"] if c in sub2.columns]
-                    st.dataframe(sub2[cols], width='stretch', height=240)
+                    display_df(sub2[cols], height=240)
 
 # -----------------------------
 # 🗓 주간 회수 계획표
@@ -626,10 +615,13 @@ with tab6:
 
     def weekly_plan(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
+        # --- 안전가드: '회수목표일자' 없으면 빈 결과 반환 ---
+        if "회수목표일자" not in df.columns:
+            return df.iloc[0:0].copy()
         due = df["회수목표일자"]
         cond = (~df["is_settled"]) & (due.notna()) & ((due < week_start) | ((due >= week_start) & (due <= week_end)))
         out = df[cond].copy()
-        # locale 의존 대신 수동 매핑
+        # 요일 숫자 → 한글 요일
         weekday = out["회수목표일자"].dt.weekday
         names = {0:"월",1:"화",2:"수",3:"목",4:"금",5:"토",6:"일"}
         out["요일"] = weekday.map(names)
@@ -641,7 +633,7 @@ with tab6:
     else:
         show_cols = [c for c in ["요일","구분","영업담당_표준","업체명","계약번호","고유넘버","회수목표일자","파이프라인","상태(세부)","금액_num","연락이력","텍스트"] if c in week_all.columns]
         week_all = week_all.sort_values(by=["요일","영업담당_표준","업체명","계약번호"])
-        st.dataframe(week_all[show_cols], width='stretch', height=520)
+        display_df(week_all[show_cols], height=520)
         st.download_button("주간 계획표 CSV 다운로드", week_all[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="weekly_collection_plan.csv", mime="text/csv")
 
 # -----------------------------
@@ -657,7 +649,6 @@ alert_all = pd.concat([build_alert_df(sunsu_s.assign(구분="선수금")), build
 if alert_all.empty:
     st.info("알림 대상(당월예정/연체)이 없습니다.")
 else:
-    # ZIP per owner
     owners = sorted(alert_all["영업담당_표준"].dropna().unique().tolist())
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -681,4 +672,4 @@ else:
         except Exception as e:
             st.warning(f"Webhook 전송 실패: {e}")
 
-st.caption("ⓘ 컬럼이 없어도 안전하게 동작하도록 모든 단계에서 가드를 추가했습니다. 요일 표기는 locale 없이 동작합니다.")
+st.caption("ⓘ 모든 표는 금액을 정수 원(3자리 콤마)로 표시합니다. '주간 계획표'는 '회수목표일자'가 없으면 자동으로 빈 결과를 반환합니다.")
