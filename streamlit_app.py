@@ -5,6 +5,7 @@ streamlit_app.py
 핫픽스 + 가독성 개선
 - 주간 계획표: '회수목표일자' KeyError 가드
 - 금액 표시: 원(정수) + 3자리 콤마 표기(모든 테이블 공통)
+- 알림 리포트: 컬럼 누락 가드(선택 가능한 컬럼만 선택), CSV도 정수 원으로 저장
 - 이전에 구현한 기능(상태 튜닝/파이프라인/권한뷰/검색/3단 그리드/알림/차트) 유지
 """
 from __future__ import annotations
@@ -226,18 +227,15 @@ def calc_match_score(sunsu: pd.Series, seongeup: pd.Series, date_half_life_days:
 # -----------------------------
 # 공통 표현: 금액 포맷 (정수 원, 콤마)
 # -----------------------------
-def _money_like(col: str, dtype) -> bool:
-    if "금액" in col or "합계" in col or col in ["금액_num", "금액"]:
-        return True
-    return False
+def _money_like(col: str) -> bool:
+    return ("금액" in col) or ("합계" in col) or (col in ["금액_num", "금액"])
 
 def display_df(df: pd.DataFrame, height: int = 420):
     """모든 테이블 표시에 공통 적용: 금액류를 정수 원으로, 3자리 콤마"""
     df2 = df.copy()
-    money_cols = [c for c in df2.columns if _money_like(c, df2[c].dtype)]
+    money_cols = [c for c in df2.columns if _money_like(c)]
     for c in money_cols:
         df2[c] = pd.to_numeric(df2[c], errors="coerce").round(0).astype("Int64")
-    # column_config 라벨 치환
     config = {}
     for c in money_cols:
         label = "금액(원)" if c == "금액_num" else c
@@ -615,13 +613,11 @@ with tab6:
 
     def weekly_plan(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df
-        # --- 안전가드: '회수목표일자' 없으면 빈 결과 반환 ---
         if "회수목표일자" not in df.columns:
             return df.iloc[0:0].copy()
         due = df["회수목표일자"]
         cond = (~df["is_settled"]) & (due.notna()) & ((due < week_start) | ((due >= week_start) & (due <= week_end)))
         out = df[cond].copy()
-        # 요일 숫자 → 한글 요일
         weekday = out["회수목표일자"].dt.weekday
         names = {0:"월",1:"화",2:"수",3:"목",4:"금",5:"토",6:"일"}
         out["요일"] = weekday.map(names)
@@ -641,20 +637,34 @@ with tab6:
 # -----------------------------
 st.markdown("---")
 st.subheader("📣 알림 리포트: 영업담당별 당월예정/연체 목록")
+
 def build_alert_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    return df[(~df["is_settled"]) & (df["상태"].isin(["연체","당월예정"]))][["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","연락이력","텍스트"]].copy()
+    if df.empty:
+        return df
+    # 필수 컬럼 가드
+    for needed in ["is_settled", "상태"]:
+        if needed not in df.columns:
+            return df.iloc[0:0].copy()
+    base = df[(~df["is_settled"]) & (df["상태"].isin(["연체","당월예정"]))].copy()
+    desired = ["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","연락이력","텍스트","구분"]
+    cols = [c for c in desired if c in base.columns]
+    base = base[cols]
+    return base
 
 alert_all = pd.concat([build_alert_df(sunsu_s.assign(구분="선수금")), build_alert_df(seon_s.assign(구분="선급금"))], ignore_index=True, sort=False)
+
 if alert_all.empty:
     st.info("알림 대상(당월예정/연체)이 없습니다.")
 else:
-    owners = sorted(alert_all["영업담당_표준"].dropna().unique().tolist())
+    # ZIP per owner (금액 정수 원으로 저장)
+    owners = sorted(alert_all["영업담당_표준"].dropna().unique().tolist()) if "영업담당_표준" in alert_all.columns else []
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for o in owners:
             sub = alert_all[alert_all["영업담당_표준"] == o].copy()
             if sub.empty: continue
+            if "금액_num" in sub.columns:
+                sub["금액_num"] = pd.to_numeric(sub["금액_num"], errors="coerce").round(0).astype("Int64")
             csv_bytes = sub.to_csv(index=False).encode("utf-8-sig")
             zf.writestr(f"{o}_알림대상.csv", csv_bytes)
     mem.seek(0)
@@ -665,11 +675,14 @@ else:
     if webhook:
         try:
             import requests
-            summary = alert_all.groupby(["구분","상태"]).size().reset_index(name="건수")
-            text_lines = ["[알림 요약]"] + [f"{r['구분']} - {r['상태']}: {int(r['건수'])}건" for _, r in summary.iterrows()]
+            summary = alert_all.groupby(["구분","상태"]).size().reset_index(name="건수") if {"구분","상태"}.issubset(alert_all.columns) else None
+            if summary is not None:
+                text_lines = ["[알림 요약]"] + [f"{r['구분']} - {r['상태']}: {int(r['건수'])}건" for _, r in summary.iterrows()]
+            else:
+                text_lines = ["[알림 요약] (컬럼 부족으로 요약 불가)"]
             resp = requests.post(webhook, json={"text": "\n".join(text_lines)}, timeout=5)
             st.success(f"Webhook 전송 결과: {resp.status_code}")
         except Exception as e:
             st.warning(f"Webhook 전송 실패: {e}")
 
-st.caption("ⓘ 모든 표는 금액을 정수 원(3자리 콤마)로 표시합니다. '주간 계획표'는 '회수목표일자'가 없으면 자동으로 빈 결과를 반환합니다.")
+st.caption("ⓘ 모든 표와 CSV는 금액을 정수 원(3자리 콤마)로 표현합니다. 누락 컬럼은 자동으로 제외하여 KeyError를 방지합니다.")
