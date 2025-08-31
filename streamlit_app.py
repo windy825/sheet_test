@@ -2,17 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 streamlit_app.py
-핫픽스 + 가독성 개선
-- 주간 계획표: '회수목표일자' KeyError 가드
-- 금액 표시: 원(정수) + 3자리 콤마 표기(모든 테이블 공통)
-- 알림 리포트: 컬럼 누락 가드(선택 가능한 컬럼만 선택), CSV도 정수 원으로 저장
-- 이전에 구현한 기능(상태 튜닝/파이프라인/권한뷰/검색/3단 그리드/알림/차트) 유지
+정산판정 수정 + AI 히스토리 추적 추가
+
+핵심 변경
+- ✅ is_settled 판정: '정산선수금고유번호' 존재만으로 완료 처리하지 않음
+  (정산여부/정산진행현황 키워드 기반으로만 완료 처리)
+- ✅ '정산진행현황' 신호(완료/회수완료/입금완료/마감 등) 반영
+- ✅ AI 히스토리: 스냅샷 비교(diff) + 텍스트/비고/연락이력에서 일정&행위 키워드 추출
+- ✅ 금액은 모든 표에서 정수 원(콤마) 표시 유지
 """
 from __future__ import annotations
 
 import io
+import json
 import math
+import os
 import re
+import hashlib
 import zipfile
 from calendar import monthrange
 from difflib import SequenceMatcher
@@ -25,6 +31,7 @@ import streamlit as st
 
 st.set_page_config(page_title="선수·선급금 매칭 & 영업 대시보드", layout="wide", page_icon="📊")
 DEFAULT_EXCEL_PATH = "./2025.07월말 선수선급금 현황_20250811.xlsx"
+HISTORY_PATH = "./_history_snapshot.jsonl"   # 로컬 파일로 스냅샷 저장
 
 # -----------------------------
 # 유틸
@@ -87,18 +94,21 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
         "정산\n선수금\n고유번호": "정산선수금고유번호",
         "정산여부\n(O/X)": "정산여부",
         "고객명\n(드롭다운)": "고객명",
-        "회수목표일정\n(YY/MM)": "회수목표일정(YY/MM)",
+        "회수목표일정\n(YY/MM)": "정산목표일정(YY/MM)",
         "경과기간\n(개월)": "경과기간(개월)",
+        "담당팀\n(변경시)": "담당팀_변경시",
         "영업담당\n(변경시)": "영업담당_변경시",
         "연락이력": "연락이력",
         "연락 이력": "연락이력",
         "진행\n현황": "진행현황",
         "진행 현황": "진행현황",
+        "정산진행현황": "정산진행현황",
     }
     for old, new in mapping.items():
         if old in df.columns and new not in df.columns:
             df.rename(columns={old: new}, inplace=True)
 
+    # 영업담당 표준 컬럼
     if "영업담당" in df.columns:
         df["영업담당_표준"] = df["영업담당"]
     elif "영업담당_변경시" in df.columns:
@@ -106,8 +116,10 @@ def ensure_keycols(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["영업담당_표준"] = None
 
-    if "진행현황" not in df.columns: df["진행현황"] = None
-    if "연락이력" not in df.columns: df["연락이력"] = None
+    # 진행/연락 기본 보장
+    for c in ["진행현황", "연락이력", "정산진행현황"]:
+        if c not in df.columns:
+            df[c] = None
 
     return df
 
@@ -126,26 +138,44 @@ def parse_due_yy_mm(val) -> Optional[pd.Timestamp]:
     last_day = monthrange(year, mm)[1]
     return pd.Timestamp(year=year, month=mm, day=last_day)
 
+# ✅ 정산판정 핵심: 키워드 기반만 사용 (링크ID 존재는 무시)
+SETTLED_KEYWORDS = [
+    "완료", "정산완료", "회수완료", "입금완료", "수납완료", "마감", "cleared", "settled", "done"
+]
+SETTLED_FLAG_VALUES = {"O","o","Y","y","1","True","TRUE","true"}
+
+def looks_settled(row: pd.Series) -> bool:
+    v1 = str(row.get("정산여부", "")).strip()
+    if v1 in SETTLED_FLAG_VALUES:
+        return True
+    v2 = str(row.get("정산진행현황", "")).strip()
+    if any(k in v2 for k in SETTLED_KEYWORDS):
+        return True
+    # 진행현황에도 신호가 있을 수 있음
+    v3 = str(row.get("진행현황", "")).strip()
+    if any(k in v3 for k in SETTLED_KEYWORDS):
+        return True
+    return False
+
 def add_common_fields(df: pd.DataFrame) -> pd.DataFrame:
     if "금액" not in df.columns:
         df["금액"] = df.apply(choose_amount_row, axis=1)
     if "전기일" in df.columns and "전기일_parsed" not in df.columns:
         df["전기일_parsed"] = pd.to_datetime(df["전기일"], errors="coerce")
+    # 회수목표일자 생성: 정산목표일정(YY/MM) → 말일
     if "회수목표일자" in df.columns:
         df["회수목표일자"] = pd.to_datetime(df["회수목표일자"], errors="coerce")
-    elif "회수목표일정(YY/MM)" in df.columns:
-        df["회수목표일자"] = df["회수목표일정(YY/MM)"].apply(parse_due_yy_mm)
+    elif "정산목표일정(YY/MM)" in df.columns:
+        df["회수목표일자"] = df["정산목표일정(YY/MM)"].apply(parse_due_yy_mm)
     else:
         df["회수목표일자"] = pd.NaT
-    df["is_settled"] = False
-    if "정산여부" in df.columns:
-        df["is_settled"] = df["is_settled"] | df["정산여부"].astype(str).str.contains("O", na=False)
-    if "정산선수금고유번호" in df.columns:
-        df["is_settled"] = df["is_settled"] | df["정산선수금고유번호"].astype(str).str.strip().ne("")
+    # ✅ 정산 여부 계산(링크ID 존재 무시)
+    df["is_settled"] = df.apply(looks_settled, axis=1)
+    # 금액 숫자
     df["금액_num"] = df["금액"].apply(to_number)
-    if "진행현황" not in df.columns: df["진행현황"] = None
-    df["진행현황_norm"] = df["진행현황"].astype(str).str.strip().str.lower()
-    if "연락이력" not in df.columns: df["연락이력"] = None
+    # 진행현황/연락이력 가드
+    for c in ["진행현황","연락이력","정산진행현황"]:
+        if c not in df.columns: df[c] = None
     return df
 
 @st.cache_data(show_spinner=False)
@@ -174,7 +204,7 @@ def find_sheet(sheets: Dict[str, pd.DataFrame], target: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# 매칭 점수
+# 매칭 점수 (동일)
 # -----------------------------
 def calc_match_score(sunsu: pd.Series, seongeup: pd.Series, date_half_life_days: int = 90) -> Tuple[float, Dict[str, float]]:
     weights = {"linked_id": 60.0, "contract": 20.0, "name": 10.0, "date": 5.0, "text": 5.0, "amount": 10.0}
@@ -182,6 +212,7 @@ def calc_match_score(sunsu: pd.Series, seongeup: pd.Series, date_half_life_days:
         return row.get(key) if key in row.index else None
 
     linked = 0.0
+    # 링크ID는 '완료' 판단이 아니라 매칭 가중치에만 반영
     seon_link = get(seongeup, "정산선수금고유번호") or get(seongeup, "정산\n선수금\n고유번호")
     sun_id = get(sunsu, "고유넘버")
     if seon_link and sun_id and str(seon_link).strip() == str(sun_id).strip():
@@ -231,15 +262,11 @@ def _money_like(col: str) -> bool:
     return ("금액" in col) or ("합계" in col) or (col in ["금액_num", "금액"])
 
 def display_df(df: pd.DataFrame, height: int = 420):
-    """모든 테이블 표시에 공통 적용: 금액류를 정수 원으로, 3자리 콤마"""
     df2 = df.copy()
     money_cols = [c for c in df2.columns if _money_like(c)]
     for c in money_cols:
         df2[c] = pd.to_numeric(df2[c], errors="coerce").round(0).astype("Int64")
-    config = {}
-    for c in money_cols:
-        label = "금액(원)" if c == "금액_num" else c
-        config[c] = st.column_config.NumberColumn(label, format="%,d")
+    config = {c: st.column_config.NumberColumn("금액(원)" if c=="금액_num" else c, format="%,d") for c in money_cols}
     st.dataframe(df2, width='stretch', height=height, column_config=config)
 
 # -----------------------------
@@ -326,22 +353,26 @@ def enrich_status_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     base.loc[cond_un & (~has_due), "상태"] = "기한미설정"
     base.loc[cond_un & has_due & (due.dt.to_period("M") > this_month), "상태"] = "향후예정"
 
-    def map_progress(s: str) -> Optional[str]:
-        if not isinstance(s, str): return None
-        t = s.strip().lower()
+    # 진행/정산 진행에서 세부상태 추출
+    def map_progress(*values: str) -> Optional[str]:
+        t = " ".join([str(x).strip().lower() for x in values if isinstance(x, str)])
+        if not t: return None
         if any(k in t for k in ["회수중", "수금중", "징수중", "collection"]): return "회수중"
         if any(k in t for k in ["협의", "논의", "컨펌", "조율"]): return "협의중"
         if any(k in t for k in ["보류", "hold", "대기"]): return "보류"
         if any(k in t for k in ["소송", "분쟁", "법무"]): return "분쟁/소송"
         if any(k in t for k in ["무응답", "연락두절"]): return "무응답"
+        if any(k in t for k in ["완료","정산완료","회수완료","입금완료","마감"]): return "완료"
         return None
 
     if "진행현황" not in base.columns: base["진행현황"] = None
-    base["세부상태"] = base["진행현황"].apply(map_progress)
+    if "정산진행현황" not in base.columns: base["정산진행현황"] = None
+    base["세부상태"] = base.apply(lambda r: map_progress(r.get("진행현황"), r.get("정산진행현황")), axis=1)
     base["상태(세부)"] = base["상태"]
     mask = base["세부상태"].notna()
     base.loc[mask, "상태(세부)"] = base.loc[mask, "상태"] + "-" + base.loc[mask, "세부상태"]
 
+    # 파이프라인
     stage = pd.Series("", index=base.index, dtype="object")
     if "회수목표일자" in base.columns:
         ddays = (due.dt.normalize() - now.normalize()).dt.days
@@ -360,11 +391,150 @@ sunsu_s = enrich_status_pipeline(df_sunsu_f)
 seon_s = enrich_status_pipeline(df_seon_f)
 
 # -----------------------------
+# AI 히스토리 추적
+# -----------------------------
+KEY_COLS_FOR_HISTORY = ["구분","키","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","상태","상태(세부)","파이프라인","정산진행현황","정산여부","연락이력","비고","금액_num"]
+
+def make_key(row: pd.Series) -> str:
+    # 고유넘버가 최우선, 없으면 전표번호+계약번호+업체명+전기일 조합 해시
+    gid = str(row.get("고유넘버", "")).strip()
+    if gid:
+        return gid
+    parts = [
+        str(row.get("전표번호","")).strip(),
+        str(row.get("계약번호","")).strip(),
+        str(row.get("업체명","")).strip(),
+        str(row.get("전기일_parsed","")).strip()
+    ]
+    base = "|".join(parts)
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+
+def build_current_snapshot() -> pd.DataFrame:
+    a = sunsu_s.assign(구분="선수금").copy()
+    b = seon_s.assign(구분="선급금").copy()
+    allv = pd.concat([a, b], ignore_index=True, sort=False)
+    allv["키"] = allv.apply(make_key, axis=1)
+    return allv
+
+def load_last_snapshot() -> Optional[pd.DataFrame]:
+    if not os.path.exists(HISTORY_PATH):
+        return None
+    try:
+        # 최신 레코드만 모아 재구성
+        records = [json.loads(line) for line in open(HISTORY_PATH, "r", encoding="utf-8")]
+        if not records:
+            return None
+        last = records[-1]  # 마지막 스냅샷
+        return pd.DataFrame(last["data"])
+    except Exception:
+        return None
+
+def save_snapshot(df: pd.DataFrame):
+    rec = {
+        "ts": pd.Timestamp.now().isoformat(),
+        "data": df[KEY_COLS_FOR_HISTORY].fillna("").astype(str).to_dict(orient="records"),
+    }
+    with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+def diff_snapshots(prev: Optional[pd.DataFrame], curr: pd.DataFrame) -> pd.DataFrame:
+    if prev is None or prev.empty:
+        return pd.DataFrame(columns=["키","변경항목","이전값","현재값","구분","업체명","계약번호","영업담당_표준","변경시각"])
+    prev_i = prev.set_index("키")
+    curr_i = curr.set_index("키")
+    changed_rows = []
+    common_keys = set(prev_i.index).intersection(set(curr_i.index))
+    cols_to_check = [c for c in KEY_COLS_FOR_HISTORY if c not in ["키"]]
+    for k in common_keys:
+        p = prev_i.loc[k]
+        c = curr_i.loc[k]
+        for col in cols_to_check:
+            pv = str(p.get(col, ""))
+            cv = str(c.get(col, ""))
+            if pv != cv:
+                changed_rows.append({
+                    "키": k, "변경항목": col, "이전값": pv, "현재값": cv,
+                    "구분": c.get("구분",""), "업체명": c.get("업체명",""),
+                    "계약번호": c.get("계약번호",""), "영업담당_표준": c.get("영업담당_표준",""),
+                    "변경시각": pd.Timestamp.now()
+                })
+    return pd.DataFrame(changed_rows)
+
+# 텍스트에서 날짜/행위 추출(룰 기반)
+DATE_PATTERNS = [
+    r"(20\d{2}[./\-](?:0?[1-9]|1[0-2])[./\-](?:0?[1-9]|[12]\d|3[01]))",  # YYYY-MM-DD/./-
+    r"((?:0?[1-9]|1[0-2])[./\-](?:0?[1-9]|[12]\d|3[01]))",              # MM-DD/./-
+    r"(?:\b|^)(\d{1,2})\s*월\s*(\d{1,2})\s*일"                           # 8월 31일
+]
+ACTION_KEYWORDS = {
+    "콜": ["통화","전화","콜","callback","call","부재"],
+    "협의": ["협의","조율","컨펌","확인중","문의"],
+    "청구": ["세금계산서","계산서","청구","인보이스","invoice","발행"],
+    "지급": ["지급","송금","이체","payment","입금"],
+    "회수": ["회수","수납","수금","입금완료","회수완료"],
+    "연체": ["연체","미납","미지급","delay","지연"],
+    "분쟁": ["분쟁","법무","소송","분쟁/소송"],
+    "보류": ["보류","hold","대기"],
+    "무응답": ["무응답","연락두절"],
+    "완료": ["완료","정산완료","마감"],
+}
+
+def extract_events(text: str) -> List[dict]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    events = []
+    # 날짜 추출
+    dates = []
+    for pat in DATE_PATTERNS:
+        for m in re.finditer(pat, text):
+            g = m.groups()
+            if len(g) == 2:  # N월 N일
+                dt = f"{pd.Timestamp.now().year}-{int(g[0]):02d}-{int(g[1]):02d}"
+            else:
+                dt = g[0]
+                if re.match(r"^\d{1,2}[./\-]\d{1,2}$", dt):  # MM-DD -> 올해로 보정
+                    mm, dd = re.split(r"[./\-]", dt)
+                    dt = f"{pd.Timestamp.now().year}-{int(mm):02d}-{int(dd):02d}"
+            try:
+                dates.append(pd.to_datetime(dt))
+            except Exception:
+                pass
+    date_hint = min(dates) if dates else None
+
+    # 행위 추출
+    labels = []
+    up = text.lower()
+    for label, keys in ACTION_KEYWORDS.items():
+        if any(k.lower() in up for k in keys):
+            labels.append(label)
+
+    if labels or date_hint is not None:
+        events.append({
+            "시점": date_hint if date_hint is not None else None,
+            "라벨": ",".join(labels) if labels else "메모",
+            "원문": text.strip()
+        })
+    return events
+
+def build_ai_timeline(df: pd.DataFrame) -> pd.DataFrame:
+    items = []
+    for _, r in df.iterrows():
+        key = r.get("키")
+        srcs = [r.get("연락이력"), r.get("비고"), r.get("텍스트")]
+        for src in srcs:
+            for ev in extract_events(str(src) if src is not None else ""):
+                items.append({"키": key, **ev, "구분": r.get("구분"), "업체명": r.get("업체명"), "계약번호": r.get("계약번호")})
+    out = pd.DataFrame(items)
+    if not out.empty and "시점" in out.columns:
+        out = out.sort_values(by=["키","시점"], na_position="last")
+    return out
+
+# -----------------------------
 # 탭
 # -----------------------------
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "👤 영업 대시보드", "🔎 매칭 조회", "⚙️ 일괄 매칭", "📊 요약 대시보드",
-    "🧭 고급 검색", "🗂 담당자-고객-계약", "🗓 주간 회수 계획표"
+    "🧭 고급 검색", "🗂 3단 그리드", "🗓 주간 계획표", "📜 히스토리"
 ])
 
 # -----------------------------
@@ -578,12 +748,12 @@ with tab4:
 
     sort_cols = [c for c in ["구분","is_settled","회수목표일자","전기일_parsed","금액_num"] if c in res.columns]
     if sort_cols: res = res.sort_values(by=sort_cols, ascending=[True, True, True, True, False]).reset_index(drop=True)
-    show_cols = [c for c in ["구분","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","정산선수금고유번호","정산여부","진행현황","연락이력","텍스트"] if c in res.columns]
+    show_cols = [c for c in ["구분","영업담당_표준","업체명","계약번호","고유넘버","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","정산선수금고유번호","정산여부","정산진행현황","진행현황","연락이력","텍스트","비고"] if c in res.columns]
     display_df(res[show_cols], height=520)
     st.download_button("검색결과 CSV 다운로드", res[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="search_results.csv", mime="text/csv")
 
 # -----------------------------
-# 🗂 담당자-고객-계약 (3단 그리드)
+# 🗂 3단 그리드
 # -----------------------------
 with tab5:
     st.subheader("담당자 → 고객 → 계약 3단 그리드")
@@ -599,11 +769,11 @@ with tab5:
                 for cust in customers:
                     st.markdown(f"**고객: {cust}**")
                     sub2 = sub[sub["업체명"] == cust].copy()
-                    cols = [c for c in ["계약번호","구분","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","진행현황","연락이력","텍스트"] if c in sub2.columns]
+                    cols = [c for c in ["계약번호","구분","전기일_parsed","회수목표일자","파이프라인","상태(세부)","금액_num","진행현황","정산진행현황","연락이력","텍스트","비고"] if c in sub2.columns]
                     display_df(sub2[cols], height=240)
 
 # -----------------------------
-# 🗓 주간 회수 계획표
+# 🗓 주간 계획표
 # -----------------------------
 with tab6:
     st.subheader("주간 회수 계획표 (미정산 + 이번주 기한/지연 포함)")
@@ -627,10 +797,38 @@ with tab6:
     if week_all.empty:
         st.info("이번 주 계획 대상이 없습니다.")
     else:
-        show_cols = [c for c in ["요일","구분","영업담당_표준","업체명","계약번호","고유넘버","회수목표일자","파이프라인","상태(세부)","금액_num","연락이력","텍스트"] if c in week_all.columns]
+        show_cols = [c for c in ["요일","구분","영업담당_표준","업체명","계약번호","고유넘버","회수목표일자","파이프라인","상태(세부)","금액_num","연락이력","텍스트","비고"] if c in week_all.columns]
         week_all = week_all.sort_values(by=["요일","영업담당_표준","업체명","계약번호"])
         display_df(week_all[show_cols], height=520)
         st.download_button("주간 계획표 CSV 다운로드", week_all[show_cols].to_csv(index=False).encode("utf-8-sig"), file_name="weekly_collection_plan.csv", mime="text/csv")
+
+# -----------------------------
+# 📜 히스토리
+# -----------------------------
+with tab7:
+    st.subheader("📜 변경 히스토리 & AI 타임라인")
+    curr = build_current_snapshot()
+    prev = load_last_snapshot()
+    diffs = diff_snapshots(prev, curr)
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**스냅샷 변경내역(diff)**")
+        if diffs.empty: st.info("직전 스냅샷 대비 변경 없음"); 
+        else: display_df(diffs[["변경시각","구분","영업담당_표준","업체명","계약번호","키","변경항목","이전값","현재값"]], height=360)
+    with colB:
+        st.markdown("**AI 추출 타임라인(연락/지급/청구/분쟁 등 키워드 & 날짜 추정)**")
+        tl = build_ai_timeline(curr)
+        if tl.empty: st.info("텍스트/비고/연락이력에서 이벤트를 찾지 못했습니다.")
+        else:
+            # 날짜 포맷
+            if "시점" in tl.columns:
+                tl["시점"] = pd.to_datetime(tl["시점"], errors="coerce")
+            display_df(tl[["시점","구분","업체명","계약번호","키","라벨","원문"]], height=360)
+
+    st.caption("좌측은 이전 스냅샷과의 diff, 우측은 비정형 텍스트에서 추출한 이벤트 타임라인입니다.")
+    if st.button("현재 상태 스냅샷 저장"):
+        save_snapshot(curr)
+        st.success("스냅샷을 저장했습니다. 다음 실행부터 변경내역이 비교됩니다.")
 
 # -----------------------------
 # 📣 알림 리포트 (CSV ZIP / Webhook)
@@ -641,12 +839,11 @@ st.subheader("📣 알림 리포트: 영업담당별 당월예정/연체 목록"
 def build_alert_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # 필수 컬럼 가드
     for needed in ["is_settled", "상태"]:
         if needed not in df.columns:
             return df.iloc[0:0].copy()
     base = df[(~df["is_settled"]) & (df["상태"].isin(["연체","당월예정"]))].copy()
-    desired = ["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","연락이력","텍스트","구분"]
+    desired = ["영업담당_표준","업체명","계약번호","고유넘버","상태","파이프라인","회수목표일자","금액_num","진행현황","정산진행현황","연락이력","텍스트","비고","구분"]
     cols = [c for c in desired if c in base.columns]
     base = base[cols]
     return base
@@ -656,7 +853,6 @@ alert_all = pd.concat([build_alert_df(sunsu_s.assign(구분="선수금")), build
 if alert_all.empty:
     st.info("알림 대상(당월예정/연체)이 없습니다.")
 else:
-    # ZIP per owner (금액 정수 원으로 저장)
     owners = sorted(alert_all["영업담당_표준"].dropna().unique().tolist()) if "영업담당_표준" in alert_all.columns else []
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -685,4 +881,4 @@ else:
         except Exception as e:
             st.warning(f"Webhook 전송 실패: {e}")
 
-st.caption("ⓘ 모든 표와 CSV는 금액을 정수 원(3자리 콤마)로 표현합니다. 누락 컬럼은 자동으로 제외하여 KeyError를 방지합니다.")
+st.caption("ⓘ '정산선수금고유번호' 존재는 완료판정을 의미하지 않습니다. 완료는 정산여부/정산진행현황 키워드로만 판단합니다. 모든 표와 CSV는 금액을 정수 원(콤마)로 표현합니다.")
